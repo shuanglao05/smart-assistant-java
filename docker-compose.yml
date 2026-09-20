@@ -1,0 +1,96 @@
+# ============================================================================
+#  IPAS 智能助手 —— Docker 部署编排
+#
+#  三个服务：mysql（数据）/ backend（Spring Boot jar）/ frontend（nginx 托管+反代）
+#
+#  使用前提（务必按顺序）：
+#   1. 在本机先构建后端 jar：
+#        cd backend && mvn -B clean package -DskipTests
+#        → 生成 backend/target/smart-assistant-java-*.jar（backend/Dockerfile 会 COPY 它）
+#   2. 准备 .env（本文件同级），填入真实密码 / SECRET_KEY（见 .env 示例）
+#   3. 启动： docker compose up -d --build
+#
+#  访问：浏览器开 http://localhost （nginx 80）
+#        后端健康：http://localhost/api/health
+#
+#  说明：所有敏感配置都走 .env（已被根 .gitignore 排除，不进版本库），
+#        后端 application.yml 里所有 ${VAR:默认值} 都会被这里的环境变量覆盖。
+# ============================================================================
+services:
+  # ---------------- 数据库 ----------------
+  mysql:
+    image: mysql:8.4
+    container_name: ipas-mysql
+    ports:                       # ← 新增这一行
+      - "3307:3306"   
+    environment:
+      MYSQL_DATABASE: ipas_assistant
+      MYSQL_USER: ipas
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      # 等 MySQL 真正可连再放行 backend 启动，避免「库还没起来后端就建表」的竞态
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - ipas-net
+
+  # ---------------- 后端 ----------------
+  backend:
+    build:
+      context: ./backend
+    container_name: ipas-backend
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      # 容器内必须绑 0.0.0.0（见 backend/Dockerfile 注释）
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: 8002
+      # 数据库连接（compose 网络内用服务名 mysql 解析）
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_DATABASE: ipas_assistant
+      MYSQL_USER: ipas
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      # JWT 签名密钥（必须用 .env 里的强随机值覆盖默认值）
+      SECRET_KEY: ${SECRET_KEY}
+      # 运行时数据目录（落卷，容器重建不丢）
+      DATA_DIR: /app/data
+      # 可选：本地 Ollama（只用云端模型可留空）
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      # 可选：云端模型（也可部署后在网页「设置→接入平台」里填，走 llm_providers）
+      CLOUD_API_KEY: ${CLOUD_API_KEY:-}
+      CLOUD_BASE_URL: ${CLOUD_BASE_URL:-}
+      CLOUD_MODEL: ${CLOUD_MODEL:-}
+    volumes:
+      - backend-data:/app/data
+    # 只对内暴露，外部统一走 nginx
+    expose:
+      - "8002"
+    networks:
+      - ipas-net
+
+  # ---------------- 前端 ----------------
+  frontend:
+    build:
+      context: ./frontend
+    container_name: ipas-frontend
+    depends_on:
+      - backend
+    ports:
+      - "80:80"
+    networks:
+      - ipas-net
+
+volumes:
+  mysql-data:
+  backend-data:
+
+networks:
+  ipas-net:
+    driver: bridge

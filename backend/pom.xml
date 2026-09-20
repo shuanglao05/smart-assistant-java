@@ -1,0 +1,283 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+ IPAS 智能助手 —— 本实现后端构建描述
+
+ 【版本矩阵说明】（这是本项目最容易踩坑的地方，务必先读）
+ Spring AI Alibaba（下称 SAA）使用【四段式】版本号：前三位锁死上游 Spring AI 的版本，
+ 第四位是 SAA 社区自己的迭代号。因此：
+ SAA 1.1.2.3 → 对应 Spring AI 1.1.2
+ 如果项目里混入 Spring AI 1.0.x，会直接抛 ClassNotFoundException（接口不匹配）。
+ 所以下面统一由 SAA 的 BOM 来锁定 Spring AI 的版本，杜绝手写版本号造成的不一致。
+
+ 完整组合（已在本机实测可完整拉取）：
+ JDK 21.0.9 （Spring Boot 3.5 要求 JDK 17+）
+ Spring Boot 3.5.15
+ Spring AI 1.1.2 （由 SAA BOM 传递引入，不手写）
+ Spring AI Alibaba 1.1.2.3
+
+ ⚠️ 不要升级到 Spring Boot 4.0.x：SAA 1.1.x 是针对 Boot 3.4/3.5 测试的，
+ 在 4.0 上强行引入大概率 ClassNotFoundException。
+
+ 【依赖组织】
+ 依赖按「Web → 安全 → 持久层 → 缓存/文档解析 → Agent 对话」分块声明，
+ 便于快速定位每个依赖的用途与版本来源（详见下方 <dependencies>）。
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+ xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+ xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+ <modelVersion>4.0.0</modelVersion>
+
+ <parent>
+ <groupId>org.springframework.boot</groupId>
+ <artifactId>spring-boot-starter-parent</artifactId>
+ <version>3.5.15</version>
+ <relativePath/>
+ </parent>
+
+ <groupId>com.ipas</groupId>
+ <artifactId>smart-assistant-java</artifactId>
+ <version>1.5.0</version>
+ <name>smart-assistant-java</name>
+ <description>IPAS 智能个人助理 —— Java + Spring AI Alibaba 后端</description>
+
+ <properties>
+ <java.version>21</java.version>
+ <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+ <!-- SAA 版本必须与 Spring AI 主版本严格对齐（见文件头说明） -->
+ <spring-ai-alibaba.version>1.1.2.3</spring-ai-alibaba.version>
+
+ <!--
+ ⚠️ Spring AI 的版本【必须】等于上面 SAA 版本号的前三段。
+
+ 踩坑记录：一开始以为"导入 SAA 的 BOM 就够了"，于是三个
+ org.springframework.ai 依赖都没写版本 —— 结果 Maven 直接报
+ 'dependencies.dependency.version is missing'。
+
+ 原因是 SAA BOM 只 import 了它自己（com.alibaba.cloud.ai）的坐标，
+ 并没有把 Spring AI 的 BOM 一并 import 进来。
+ 所以必须自己再导入一次 spring-ai-bom，两者版本严格对齐。
+
+ 改版本时这两行必须一起改，否则会 ClassNotFoundException。
+ -->
+ <spring-ai.version>1.1.2</spring-ai.version>
+
+ <jjwt.version>0.12.6</jjwt.version>
+ </properties>
+
+ <dependencyManagement>
+ <dependencies>
+ <!--
+ SAA 官方 BOM：锁定 com.alibaba.cloud.ai:*（graph-core /
+ agent-framework / starter-* 等）的版本。
+ -->
+ <dependency>
+ <groupId>com.alibaba.cloud.ai</groupId>
+ <artifactId>spring-ai-alibaba-bom</artifactId>
+ <version>${spring-ai-alibaba.version}</version>
+ <type>pom</type>
+ <scope>import</scope>
+ </dependency>
+
+ <!--
+ Spring AI 官方 BOM：锁定 org.springframework.ai:*（openai /
+ ollama / chat-memory-repository-jdbc / client-chat 等）的版本。
+ 没有它会报 version is missing（见上面 spring-ai.version 的说明）。
+ -->
+ <dependency>
+ <groupId>org.springframework.ai</groupId>
+ <artifactId>spring-ai-bom</artifactId>
+ <version>${spring-ai.version}</version>
+ <type>pom</type>
+ <scope>import</scope>
+ </dependency>
+ </dependencies>
+ </dependencyManagement>
+
+ <dependencies>
+ <!-- ============ Web 层 ============ -->
+ <dependency>
+ <groupId>org.springframework.boot</groupId>
+ <artifactId>spring-boot-starter-web</artifactId>
+ </dependency>
+ <!-- 参数校验：提供 @Valid / @NotBlank / @Size 等 Bean Validation 注解，用于约束请求体字段 -->
+ <dependency>
+ <groupId>org.springframework.boot</groupId>
+ <artifactId>spring-boot-starter-validation</artifactId>
+ </dependency>
+
+ <!-- ============ 安全 / 鉴权 ============ -->
+ <!-- 安全框架：基于 Spring Security，负责登录鉴权、接口保护、密码哈希 -->
+ <dependency>
+ <groupId>org.springframework.boot</groupId>
+ <artifactId>spring-boot-starter-security</artifactId>
+ </dependency>
+ <dependency>
+ <groupId>io.jsonwebtoken</groupId>
+ <artifactId>jjwt-api</artifactId>
+ <version>${jjwt.version}</version>
+ </dependency>
+ <dependency>
+ <groupId>io.jsonwebtoken</groupId>
+ <artifactId>jjwt-impl</artifactId>
+ <version>${jjwt.version}</version>
+ <scope>runtime</scope>
+ </dependency>
+ <dependency>
+ <groupId>io.jsonwebtoken</groupId>
+ <artifactId>jjwt-jackson</artifactId>
+ <version>${jjwt.version}</version>
+ <scope>runtime</scope>
+ </dependency>
+
+ <!-- ============ 持久层 ============ -->
+ <!-- 持久层：Spring Data JPA（ORM）+ MySQL 驱动，负责实体映射与数据库访问 -->
+ <dependency>
+ <groupId>org.springframework.boot</groupId>
+ <artifactId>spring-boot-starter-data-jpa</artifactId>
+ </dependency>
+ <dependency>
+ <groupId>com.mysql</groupId>
+ <artifactId>mysql-connector-j</artifactId>
+ <scope>runtime</scope>
+ </dependency>
+
+ <!-- ============ 开发期辅助 ============ -->
+ <!-- Lombok：只为消除 getter/setter/构造器的机械样板代码。
+ 注意：实体类上【不要】用 @Data —— 它会生成 equals/hashCode，
+ 而 JPA 实体的 equals 依赖未初始化的 id，放在 Set 里会引发诡异问题。
+ 实体统一用 @Getter + @Setter。 -->
+ <dependency>
+ <groupId>org.projectlombok</groupId>
+ <artifactId>lombok</artifactId>
+ <optional>true</optional>
+ </dependency>
+ <dependency>
+ <groupId>org.springframework.boot</groupId>
+ <artifactId>spring-boot-starter-test</artifactId>
+ <scope>test</scope>
+ </dependency>
+
+ <!-- ============ 缓存（AgentCache 的有界缓存） ============ -->
+ <!-- Caffeine：本项目的 Agent 缓存原先用"无界的 ConcurrentHashMap"，
+ 会随「会话数 × 模型/技能等配置变体」无限增长（每个 Agent 都挂着
+ 一个 ChatModel 与编译好的图），长期运行有内存泄漏风险。
+ 改用 Caffeine 做「有上限 + 空闲过期」的缓存。
+ 版本由 Spring Boot BOM 统一管理，所以【不写 version】。 -->
+ <dependency>
+ <groupId>com.github.ben-manes.caffeine</groupId>
+ <artifactId>caffeine</artifactId>
+ </dependency>
+
+ <!-- ============ PDF 正文抽取 ============ -->
+ <!-- 让上传的 PDF 能抽出正文并进入 RAG 索引（此前 PDF 分支是 TODO，返回空正文）。
+ ⚠️ PDFBox 3.x 的 API 与 2.x 不同：3.x 用静态的 Loader.loadPDF(...)，
+ 2.x 的 PDDocument.load(...) 已被移除。 -->
+ <dependency>
+ <groupId>org.apache.pdfbox</groupId>
+ <artifactId>pdfbox</artifactId>
+ <version>3.0.3</version>
+ <exclusions>
+ <!-- 经典类路径重复：Spring Boot 已内置 spring-jcl，它提供了同一套
+ org.apache.commons.logging API。若再把 commons-logging 拉进来，
+ 同一个包会出现两份实现（谁先加载不一定），排除掉更干净。 -->
+ <exclusion>
+ <groupId>commons-logging</groupId>
+ <artifactId>commons-logging</artifactId>
+ </exclusion>
+ </exclusions>
+ </dependency>
+
+ <!-- ================================================================
+ 第三阶段：Agent 与对话能力
+ ================================================================
+
+ 【为什么依赖"实现类"而不是"starter"】
+
+ Spring AI 的 starter（如 spring-ai-starter-model-openai）=
+ 模型实现 + Spring Boot 自动配置。
+
+ 但本项目的模型是【运行时按会话动态构造】的：用户可能给每个会话
+ 选不同的平台和模型，凭据存在 llm_providers 表 / app_settings 表里。
+ 这对应本项目的 ChatModelFactory —— 每次构建 Agent 时才按会话配置
+ 动态 new 一个模型实例。
+
+ 因此我们不需要（也不想要）自动配置出来的那个单例 ChatModel Bean：
+ · 它用不上（我们的模型来自数据库，不是配置文件）；
+ · 还会带来启动校验问题（Spring AI 的 OpenAI 自动配置要求
+ 必须有 api-key，而本项目允许"只用本地 Ollama、完全不配云端"）。
+
+ 所以直接依赖实现类，自己 new。
+ ================================================================ -->
+
+ <!-- 云端 OpenAI 兼容模型（智谱 / DeepSeek / 百炼 / 硅基流动 / OpenAI 官方），
+ 由 ChatModelFactory 按 base_url + api_key 动态构造 -->
+ <dependency>
+ <groupId>org.springframework.ai</groupId>
+ <artifactId>spring-ai-openai</artifactId>
+ </dependency>
+
+ <!-- 本地 Ollama。注意：要关闭 qwen3 的思考必须走 Ollama 原生接口，
+ OpenAI 兼容端点没有该开关 -->
+ <dependency>
+ <groupId>org.springframework.ai</groupId>
+ <artifactId>spring-ai-ollama</artifactId>
+ </dependency>
+
+ <!-- 对话记忆落库（MySQL）。⚠️ 本项目用 MySQL 的原因之一：
+ 该记忆仓库只内置 hsqldb / mariadb(MySQL) / postgresql / sqlserver 四种方言，
+ 没有 SQLite，所以记忆持久化必须用 MySQL -->
+ <dependency>
+ <groupId>org.springframework.ai</groupId>
+ <artifactId>spring-ai-model-chat-memory-repository-jdbc</artifactId>
+ </dependency>
+
+ <!-- Spring AI Alibaba Graph：底层工作流运行时
+ （StateGraph / CompiledGraph / CheckpointSaver） -->
+ <dependency>
+ <groupId>com.alibaba.cloud.ai</groupId>
+ <artifactId>spring-ai-alibaba-graph-core</artifactId>
+ </dependency>
+
+ <!-- Spring AI Alibaba Agent Framework：高层 Agent API（ReactAgent），
+ 用声明式方式把「模型 + 工具 + 提示词」组装成可运行的智能体 -->
+ <dependency>
+ <groupId>com.alibaba.cloud.ai</groupId>
+ <artifactId>spring-ai-alibaba-agent-framework</artifactId>
+ </dependency>
+ </dependencies>
+
+ <build>
+  <plugins>
+   <!--
+   本地私有配置 application-local.yml 只应在本地开发时生效，
+   绝不能打进部署 jar（尤其 Docker 镜像），否则会把本机密码/本地 127.0.0.1
+   地址带到容器里，覆盖掉环境变量注入的生产配置。
+   maven-jar-plugin 的 exclude 只影响最终 jar，不影响 target/classes，
+   因此本地 mvn spring-boot:run / IDE 运行仍然能读到该文件。
+   -->
+   <plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-jar-plugin</artifactId>
+    <configuration>
+     <excludes>
+      <exclude>application-local.yml</exclude>
+     </excludes>
+    </configuration>
+   </plugin>
+
+   <plugin>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-maven-plugin</artifactId>
+    <configuration>
+     <excludes>
+      <exclude>
+       <groupId>org.projectlombok</groupId>
+       <artifactId>lombok</artifactId>
+      </exclude>
+     </excludes>
+    </configuration>
+   </plugin>
+  </plugins>
+ </build>
+</project>

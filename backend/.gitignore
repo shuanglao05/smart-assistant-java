@@ -1,0 +1,37 @@
+# ---- 构建产物 ----
+target/
+*.jar
+*.war
+!.mvn/wrapper/maven-wrapper.jar
+
+# ---- IDE ----
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+
+# ---- 运行时数据目录（数据库 / 上传文件 / 缓存 / 会话记忆） ----
+# 与原 Python 项目保持一致：数据一律放 data/，便于整体备份与迁移
+data/
+
+# ---- 配置中的敏感信息 ----
+# application-local.yml 里会写数据库密码、API Key，绝不能进版本库
+src/main/resources/application-local.yml
+src/main/resources/application-local.yaml
+*.env
+
+# ---- 凭据探测残留物 ----
+# ⚠️ 如果发现根目录出现数据库连接探测文件（内含主机、账号、加密口令），
+#    它们属于凭据材料，必须排除在版本库之外。
+#    注意：这类文件不是你手写的，别把它提交上去。
+.navicat-probe.txt
+*-probe.txt
+*.probe.txt
+
+# ---- 日志 ----
+logs/
+*.log

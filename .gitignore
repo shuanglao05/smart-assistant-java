@@ -1,0 +1,57 @@
+# ============================================================================
+#  项目级 .gitignore（smart-assistant-java/）
+#
+#  注意：backend/.gitignore 里还有一份「后端专用」的忽略规则
+#  （Maven 构建产物、application-local.yml 等），两者叠加生效。
+#  这里只管「整个项目根目录」层面要排除的东西。
+# ============================================================================
+
+# ---- 依赖与构建产物 ----
+node_modules/
+dist/
+dist-ssr/
+target/
+*.jar
+*.war
+
+# ---- IDE / 编辑器 ----
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+*.swp
+*~
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 日志与临时文件 ----
+logs/
+*.log
+npm-debug.log*
+yarn-error.log*
+*.tmp
+*.bak
+
+# ---- 敏感信息 ----
+# ⚠️ 后端的 application-local.yml（含数据库密码）由 backend/.gitignore 排除
+*.env
+# 显式再写一次 .env：某些 glob 实现对「以点开头的文件名」匹配不一致，
+# 这里是双保险 —— 它里面是 Docker 的真实数据库密码 / SECRET_KEY / 云端 Key，
+# 一旦进版本库就等于把凭据公开，绝对不能省略。
+.env
+.env.local
+.env.*.local
+
+# ---- 凭据探测残留物 ----
+# 这类文件可能包含数据库主机、账号、加密口令等信息，绝不能提交。
+# 若发现根目录出现它们，请确认后手动删除。
+.navicat-probe.txt
+*-probe.txt
+*.probe.txt

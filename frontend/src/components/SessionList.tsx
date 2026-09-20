@@ -1,0 +1,282 @@
+/**
+ * SessionList.tsx —— 左侧会话列表（含会话内搜索）
+ *
+ * 职责：
+ * 展示全部会话并高亮当前会话，提供新建 / 选择 / 重命名 / 删除 / 清空，
+ * 以及跨会话的内容搜索（搜到结果可直接跳到对应会话）。
+ *
+ * 组件属性（props）：
+ * sessions / currentId —— 会话数据与当前选中项
+ * sidebarOpen / onToggleSidebar —— 侧栏开合
+ * onSelect / onCreate / onDelete / onRename / onClearAll —— 各类操作回调
+ *
+ * 组件状态：
+ * editingId / draft —— 正在就地重命名的会话 id 与其草稿标题
+ * q / results —— 搜索关键词与命中结果
+ *
+ * 说明：
+ * 组件本身不持有会话数据，全部由父级 MainLayout 传入，属「受控展示 + 回调」模式；
+ * 这样删除/重命名后的刷新逻辑只需在父级实现一处。
+ */
+import { useEffect, useRef, useState } from 'react'
+import { ChevronsLeft, ChevronsRight, MessageSquare, Pencil, Plus, Search, Settings, Trash2, X } from 'lucide-react'
+import { searchApi } from '../api'
+import type { SearchHit, Session, UserProfile } from '../types'
+
+/** 头像可能是表情（预设），也可能是 data URL / http 图片（上传） */
+function isImageAvatar(a: string) {
+ return a.startsWith('data:') || a.startsWith('http://') || a.startsWith('https://')
+}
+
+export default function SessionList({
+ sessions,
+ currentId,
+ sidebarOpen,
+ onToggleSidebar,
+ onSelect,
+ onCreate,
+ onDelete,
+ onRename,
+ onClearAll,
+ onOpenSettings,
+ onLogout,
+ profile,
+}: {
+ sessions: Session[]
+ currentId: number | null
+ sidebarOpen: boolean
+ onToggleSidebar: () => void
+ onSelect: (id: number) => void
+ onCreate: () => void
+ onDelete: (id: number) => void
+ onRename: (id: number, title: string) => void
+ onClearAll: () => void
+ onOpenSettings: () => void
+ onLogout: () => void
+ profile: UserProfile | null
+}) {
+ const [editingId, setEditingId] = useState<number | null>(null)
+ const [draft, setDraft] = useState('')
+ const [q, setQ] = useState('')
+ const [results, setResults] = useState<SearchHit[]>([])
+ const timerRef = useRef<number | null>(null)
+
+ const searching = q.trim().length > 0
+
+ // 搜索历史消息：防抖 250ms
+ useEffect(() => {
+ const kw = q.trim()
+ if (!kw) {
+ setResults([])
+ return
+ }
+ if (timerRef.current) window.clearTimeout(timerRef.current)
+ timerRef.current = window.setTimeout(() => {
+ searchApi
+ .query(kw)
+ .then(({ data }) => setResults(data))
+ .catch(() => setResults([]))
+ }, 250)
+ return () => {
+ if (timerRef.current) window.clearTimeout(timerRef.current)
+ }
+ }, [q])
+
+ const openHit = (hit: SearchHit) => {
+ onSelect(hit.conversation_id)
+ setQ('')
+ setResults([])
+ }
+
+ const startRename = (s: Session) => {
+ setEditingId(s.id)
+ setDraft(s.title || '')
+ }
+
+ const commit = () => {
+ const t = draft.trim()
+ if (editingId != null && t) onRename(editingId, t)
+ setEditingId(null)
+ }
+
+ const avatar = profile?.avatar?.trim()
+ const avatarNode = avatar ? (
+ isImageAvatar(avatar) ? (
+ <img src={avatar} alt="头像" />
+ ) : (
+ avatar
+ )
+ ) : (
+ 'AI'
+ )
+
+ return (
+ <aside className={`sidebar ${sidebarOpen ? '' : 'collapsed'}`}>
+ <div className="brand">
+ {sidebarOpen ? (
+ <>
+ <div className="brand-logo">{avatarNode}</div>
+ <div className="brand-text">
+ <div className="brand-name">智能助理</div>
+ <div className="brand-user">
+ {profile?.nickname || localStorage.getItem('username')}
+ </div>
+ </div>
+ <button className="sidebar-toggle" onClick={onToggleSidebar} title="收起侧边栏">
+ <ChevronsLeft size={15} />
+ </button>
+ </>
+ ) : (
+ <>
+ <div
+ className="brand-logo"
+ title={profile?.nickname || localStorage.getItem('username') || ''}
+ >
+ {avatarNode}
+ </div>
+ <button className="sidebar-toggle" onClick={onToggleSidebar} title="展开侧边栏">
+ <ChevronsRight size={15} />
+ </button>
+ </>
+ )}
+ </div>
+
+ {sidebarOpen && (
+ <>
+ <button className="btn new-chat" onClick={onCreate} title="新建一个对话">
+ <Plus size={14} /> 新建会话
+ </button>
+
+ <button
+ className="btn clear-all"
+ onClick={() => {
+ if (sessions.length === 0) return
+ if (confirm('确定清空全部历史会话？此操作不可撤销')) onClearAll()
+ }}
+ disabled={sessions.length === 0}
+ title="清空当前账号下的全部历史会话"
+ >
+ <Trash2 size={14} /> 清空全部
+ </button>
+
+ <div className="search-area">
+ <div className="search-row">
+ <span className="search-ico"><Search size={13} /></span>
+ <input
+ className="sidebar-search"
+ placeholder="搜索全部历史…"
+ value={q}
+ onChange={(e) => setQ(e.target.value)}
+ onKeyDown={(e) => {
+ if (e.key === 'Escape') {
+ setQ('')
+ setResults([])
+ }
+ }}
+ />
+ {searching && (
+ <button
+ className="search-clear"
+ onClick={() => {
+ setQ('')
+ setResults([])
+ }}
+ title="清空搜索"
+ >
+ <X size={14} />
+ </button>
+ )}
+ </div>
+
+ {searching && (
+ <div className="search-results">
+ {results.length === 0 ? (
+ <div className="search-empty">没有匹配结果</div>
+ ) : (
+ results.map((r, i) => (
+ <div key={i} className="search-item" onClick={() => openHit(r)} title={r.title}>
+ <span className={`search-tag ${r.role}`}>
+ {r.role === 'user' ? '我' : r.role === 'assistant' ? 'AI' : '会话'}
+ </span>
+ <div className="search-body">
+ <div className="search-title">{r.title}</div>
+ <div className="search-snippet">{r.content}</div>
+ </div>
+ </div>
+ ))
+ )}
+ </div>
+ )}
+ </div>
+
+ {!searching && (
+ <div className="session-scroll">
+ {sessions.map((s) => (
+ <div
+ key={s.id}
+ className={`session-item ${s.id === currentId ? 'active' : ''}`}
+ onClick={() => onSelect(s.id)}
+ onDoubleClick={() => startRename(s)}
+ >
+ <MessageSquare size={14} className="session-ico" />
+ {editingId === s.id ? (
+ <input
+ className="rename-input"
+ value={draft}
+ autoFocus
+ onClick={(e) => e.stopPropagation()}
+ onChange={(e) => setDraft(e.target.value)}
+ onKeyDown={(e) => {
+ if (e.key === 'Enter') commit()
+ else if (e.key === 'Escape') setEditingId(null)
+ }}
+ onBlur={commit}
+ />
+ ) : (
+ <span className="session-title" title="双击重命名">
+ {s.title || '新对话'}
+ </span>
+ )}
+ <button
+ className="session-edit"
+ title="重命名"
+ onClick={(e) => {
+ e.stopPropagation()
+ startRename(s)
+ }}
+ >
+ <Pencil size={13} />
+ </button>
+ <button
+ className="session-del"
+ title="删除"
+ onClick={(e) => {
+ e.stopPropagation()
+ if (confirm('删除该会话及其消息？')) onDelete(s.id)
+ }}
+ >
+ <X size={14} />
+ </button>
+ </div>
+ ))}
+ </div>
+ )}
+
+ <div className="sidebar-footer">
+ <button className="logout" onClick={onLogout} title="退出当前账号">
+ 退出登录
+ </button>
+ <button
+ className="settings-gear"
+ onClick={onOpenSettings}
+ title="设置"
+ aria-label="设置"
+ >
+ <Settings size={15} />
+ </button>
+ </div>
+ </>
+ )}
+ </aside>
+ )
+}

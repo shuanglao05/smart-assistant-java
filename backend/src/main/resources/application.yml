@@ -1,0 +1,227 @@
+# ============================================================================
+#  IPAS 智能助手 —— 主配置文件
+#
+#  本文件集中管理应用的所有可调参数，并通过 @ConfigurationProperties 绑定到
+#  AppProperties 类，各模块统一从该类读取配置（配置只在启动时绑定一次，避免散落各处）。
+#
+#  凡是以 ${XXX:默认值} 形式出现的，都可以用环境变量覆盖：
+#  既能在本地直接用默认值跑起来，也能在部署时用环境变量注入而不改代码。
+# ============================================================================
+
+server:
+  # 监听 127.0.0.1:8002。
+  # 必须显式绑 127.0.0.1 而不是 localhost —— Windows 下 localhost 会解析到 ::1，
+  # 而前端 vite 代理配的是 http://127.0.0.1:8002，绑错会报 upstream connect failed。
+  address: 127.0.0.1
+  port: 8002
+  # 关掉 Spring 默认的错误页 JSON 包装，改由 GlobalExceptionHandler 统一输出
+  # {"detail": "..."} 形式的错误体，保证前端错误处理逻辑一致。
+  error:
+    whitelabel:
+      enabled: false
+
+spring:
+  application:
+    name: smart-assistant-java
+
+  # ---------------------------------------------------------------- 本地私有配置
+  # 把「不该进版本库」的东西（数据库密码、各类 API Key）单独放 application-local.yml，
+  # 它已在 .gitignore 里排除。
+  #
+  # 前缀 optional: 的意义：文件不存在时【不报错】，直接用 application.yml 里的默认值。
+  # 这样别人拿到仓库、没建这个文件也能启动（用默认的 root/空密码），
+  # 而你的机器上因为有这个文件，会自动用你真实的密码覆盖。
+  #
+  # 已导入的配置优先级高于本文档，所以 application-local.yml 里的值会覆盖下面的默认值。
+  config:
+    import: optional:classpath:application-local.yml
+
+  # ---------------------------------------------------------------- 数据源
+  # 使用 MySQL：Spring AI 的对话记忆仓库只内置 hsqldb/mysql/postgresql/sqlserver
+  # 四种方言、没有 SQLite，所以记忆持久化必须用 MySQL。
+  datasource:
+    # ⚠️ 时间参数踩坑记录（两条，都很隐蔽）
+    #
+    # 【坑 1】characterEncoding 必须写 Java 字符集名 UTF-8，不能写 MySQL 的 utf8mb4。
+    #   这是两个不同层面的名字：
+    #     · utf8mb4 是【MySQL 服务端】的字符集名，用在建库建表语句里；
+    #     · JDBC 参数 characterEncoding 会被交给 Java 的 Charset.forName() 解析，
+    #       只认 UTF-8 这类【Java 字符集名】。
+    #   写错会直接启动失败：Unsupported character encoding 'utf8mb4'
+    #   Connector/J 8.x 在 UTF-8 + 服务端 utf8mb4 的情况下会自动使用 utf8mb4，无需也无法显式指定。
+    #
+    # 【坑 2】不要用 serverTimezone=UTC，改用 connectionTimeZone=LOCAL + preserveInstants=false。
+    #   实测现象：实体里是 08:22:56（UTC），接口也返回 08:22:56，但数据库里却存成 00:22:56
+    #   —— 驱动把「UTC 墙上时间」当成 JVM 本地时间（东八区）又减了 8 小时。
+    #   读回来是对得上的（接口层看不出异常），但在 Navicat 里查数据会明显不对劲，
+    #   而且一旦有人用 SQL 直接统计时间就会全错。
+    #   原因：preserveInstants 默认为 true，驱动会在「JVM 默认时区」与「connectionTimeZone」
+    #   之间做瞬时转换。我们存的是 LocalDateTime（无时区的墙上时间），不需要也不该被转换。
+    #   解法：connectionTimeZone=LOCAL（与 JVM 同区）+ preserveInstants=false（禁止转换），
+    #   这样写进去什么、读出来就是什么。
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:${MYSQL_PORT:3306}/${MYSQL_DATABASE:ipas_assistant}?useUnicode=true&characterEncoding=UTF-8&connectionTimeZone=LOCAL&preserveInstants=false&allowPublicKeyRetrieval=true&useSSL=false
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:}
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      # 连接池由 HikariCP 原生管理（自带保活），无需手写保活逻辑
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 10000
+      # MySQL 默认 8 小时断开空闲连接，设 30 分钟回收一次更保险
+      max-lifetime: 1800000
+      pool-name: IpasHikariPool
+
+  # ---------------------------------------------------------------- JPA
+  jpa:
+    # 不用 Hibernate 自动建表：表结构由 db/schema-mysql.sql 显式管理，
+    # 这样表结构是可读、可评审、可版本控制的。
+    hibernate:
+      ddl-auto: none
+    # 启动时校验实体与表结构是否一致：不一致直接启动失败，
+    # 避免运行到一半才发现「列不存在」。（比 ddl-auto=update 安全得多）
+    properties:
+      hibernate:
+        format_sql: true
+    open-in-view: false   # 关掉 OSIV：避免数据库连接被 HTTP 请求全程占用
+
+  # 启动时执行建表脚本（脚本内部一律 IF NOT EXISTS，可重复执行）
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:db/schema-mysql.sql
+      continue-on-error: false
+
+  # ---------------------------------------------------------------- Jackson
+  # 【极其关键】接口 JSON 的命名与格式必须与前端约定一致，否则 React 前端要跟着改。
+  jackson:
+    # 接口 JSON 统一采用 snake_case 命名（active_skill_ids / created_at / token_type），
+    # 而 Java 字段是 camelCase（activeSkillIds），这里统一转成 snake_case 输出。
+    property-naming-strategy: SNAKE_CASE
+    # 时间序列化为 ISO-8601 字符串而不是时间戳
+    serialization:
+      write-dates-as-timestamps: false
+      fail-on-empty-beans: false
+    # 忽略请求体里的未知字段，避免前端多传字段导致 400
+    deserialization:
+      fail-on-unknown-properties: false
+    time-zone: UTC
+
+  # 上传文件大小上限；超过后走 files 模块的自定义校验给出中文提示，这个值是兜底防线
+  servlet:
+    multipart:
+      max-file-size: 64MB
+      max-request-size: 64MB
+
+# ============================================================================
+#  应用自身的业务配置（绑定到 AppProperties 类）
+# ============================================================================
+app:
+  # ---- 安全 / JWT ----
+  security:
+    # ⚠️ 生产环境必须用环境变量覆盖，绝不能用这个开发默认值
+    secret-key: ${SECRET_KEY:dev-secret-change-me}
+    # 签名算法固定 HS256；jjwt 需要显式写 "HS256"
+    algorithm: HS256
+    # 默认 1440 分钟 = 24 小时
+    access-token-expire-minutes: ${ACCESS_TOKEN_EXPIRE_MINUTES:1440}
+
+  # ---- 数据目录 ----
+  # 上传文件、缓存等运行时数据统一放在 data/ 下，便于整体备份迁移：
+  # data/uploads 存原始文件，data/cache 存磁盘缓存。
+  data-dir: ${DATA_DIR:./data}
+
+  # ---- 大模型 ----
+  llm:
+    # ollama = 本地推理；cloud = 云端 OpenAI 兼容平台
+    provider: ${LLM_PROVIDER:ollama}
+    ollama:
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
+      model: ${OLLAMA_MODEL:qwen3:8b}
+      # 关闭 qwen3 的思考：开思考会明显变慢，日常问答不需要
+      think: ${OLLAMA_THINK:false}
+      # 上下文窗口大小
+      num-ctx: ${OLLAMA_NUM_CTX:8192}
+    cloud:
+      api-key: ${CLOUD_API_KEY:}
+      base-url: ${CLOUD_BASE_URL:}
+      model: ${CLOUD_MODEL:}
+      # 云端「深度思考」开关；仅对流式调用生效
+      enable-thinking: ${CLOUD_ENABLE_THINKING:false}
+      thinking-budget: ${CLOUD_THINKING_BUDGET:0}
+    # 视觉模型：用于课表截图识别等多模态任务
+    vision-model: ${VISION_MODEL:qwen3-vl-plus}
+
+  # ---- Embedding / RAG ----
+  rag:
+    embed-base-url: ${EMBED_BASE_URL:http://localhost:11434/v1}
+    embed-model: ${EMBED_MODEL:bge-m3}
+    # 每个片段的目标字符数
+    chunk-size: ${RAG_CHUNK_SIZE:500}
+    # 相邻片段重叠字符数
+    chunk-overlap: ${RAG_CHUNK_OVERLAP:80}
+    # 全局默认检索片段数（Top-K）
+    top-k: ${RAG_TOP_K:4}
+    # 向量化批大小：一次发给 Ollama 的文本条数
+    embed-batch: ${RAG_EMBED_BATCH:32}
+    # 单次检索返回片段总上限：多知识库各自取 Top-K 后合并，防止撑爆上下文
+    max-total-chunks: ${RAG_MAX_TOTAL_CHUNKS:30}
+
+  # ---- 对话上下文管理（历史压缩相关配置）----
+  history:
+    # 保留最近多少条原始消息（其余压缩进摘要）
+    keep-recent: ${HISTORY_KEEP_RECENT:12}
+    # 消息总数超过 keep-recent + 该值才启动摘要，避免短对话也调模型
+    summary-trigger: ${HISTORY_SUMMARY_TRIGGER:8}
+    # 防抖：新滑出窗口的消息不足这么多条时复用旧摘要
+    summary-step: ${HISTORY_SUMMARY_STEP:6}
+    # 单次喂给摘要模型的字符上限
+    summary-max-chars: ${HISTORY_SUMMARY_MAX_CHARS:6000}
+    # 摘要提示词里的字数上限
+    summary-max-words: ${HISTORY_SUMMARY_MAX_WORDS:300}
+    # 上下文压缩触发阈值（token）：SummarizationHook 用；超过才压缩。
+    # 按 token 数触发（更贴合真实上下文占用），而非按消息条数。
+    # <= 0 表示关闭上下文压缩（不挂该 hook）。
+    summary-max-tokens: ${HISTORY_SUMMARY_MAX_TOKENS:3000}
+
+  # ---- Agent 模型侧的对话记忆 ----
+  agent:
+    memory:
+      # 记忆落库表的建表模式。三选一：
+      #   CREATE_IF_NOT_EXISTS（默认，推荐）—— 幂等：表已存在就保留，不碰数据
+      #   CREATE_NONE                       —— 不建表，需由 DBA 预先建好
+      #                                         （数据库账号没有建表权限时必须用它）
+      #   CREATE_OR_REPLACE                 —— 【危险】重建表 = 清空用户的对话记忆
+      #
+      # ⚠️ 契约测试用的是 CREATE_NONE：那套测试刻意不依赖 MySQL，
+      #    而 CREATE_IF_NOT_EXISTS 在构造时要连库执行 DDL，在无库环境会失败。
+      create-option: ${AGENT_MEMORY_CREATE_OPTION:CREATE_IF_NOT_EXISTS}
+
+  # ---- 文件上传 ----
+  upload:
+    max-mb: ${MAX_UPLOAD_MB:50}
+    max-content-chars: ${MAX_CONTENT_CHARS:500000}
+
+  # ---- 外部 API Key ----
+  tools:
+    # 天气优先高德（中文城市名、国内访问稳定）
+    amap-api-key: ${AMAP_API_KEY:}
+    openweathermap-api-key: ${OPENWEATHERMAP_API_KEY:}
+
+  # ---- CORS 跨域白名单 ----
+  cors:
+    allowed-origins:
+      - http://localhost:5174
+      - http://127.0.0.1:5174
+
+# ============================================================================
+#  日志
+# ============================================================================
+logging:
+  level:
+    root: INFO
+    com.ipas.assistant: DEBUG
+    # 排查云端报错时重点看这两行日志（SQL 与业务日志）
+    org.hibernate.SQL: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"

@@ -1,0 +1,5 @@
+# 前端构建上下文忽略：node_modules / dist 由镜像内重新 install + build 生成，
+# 不必从本机拷进构建上下文（否则又慢又可能带入陈旧产物）。
+node_modules/
+dist/
+.git

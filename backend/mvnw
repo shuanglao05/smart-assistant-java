@@ -1,0 +1,74 @@
+#!/bin/sh
+#
+# mvnw —— Maven 启动包装脚本（Unix / Git Bash 用）
+#
+# 【为什么需要这个脚本，而不能直接用 mvn】
+#   本机 Maven 装的是完整版（boot/plexus-classworlds-2.6.0.jar 都在），
+#   但它自带的 bin/mvn 是个 shell 脚本，内部靠 dirname / cygpath 计算类路径：
+#       CLASSWORLDS_JAR=`echo "${MAVEN_HOME}"/boot/plexus-classworlds-*.jar`
+#   在 Git Bash 里这两个命令拿不到（或 MAVEN_HOME 是 D:\ 反斜杠形式），
+#   CLASSWORLDS_JAR 拼成空串，于是报：
+#       错误: 找不到或无法加载主类 org.codehaus.plexus.classworlds.launcher.Launcher
+#   本脚本绕过那段 shell 逻辑，直接调 java 启动 classworlds Launcher（实测可用）。
+#
+# 【用法】
+#   ./mvnw clean package        与普通 mvn 完全一致
+#   ./mvnw spring-boot:run      启动应用
+#
+# 【自定义 Maven 位置】
+#   设环境变量 MAVEN_HOME 即可；未设时按下面的候选列表依次探测。
+
+# 本工具环境里 PATH 可能不含 coreutils，先补上（对普通终端无副作用）
+PATH="/usr/bin:/bin:$PATH"
+export PATH
+
+# ---- 1. 确定 MAVEN_HOME ----
+# 统一转成 "D:/xxx/yyy" 形式：Java 认识这种路径，Git Bash 也能用它做 glob。
+normalize() {
+    printf '%s' "$1" | tr '\\' '/'
+}
+
+MVN_HOME="$(normalize "${MAVEN_HOME:-${M2_HOME:-}}")"
+
+if [ -z "$MVN_HOME" ] || [ ! -d "$MVN_HOME/boot" ]; then
+    for candidate in \
+        "D:/Maven/apache-maven-3.8.9-bin/apache-maven-3.8.9" \
+        "$(normalize "$HOME")/.m2/wrapper/dists/apache-maven-3.9.16/56ba1f9f" \
+        "/usr/share/maven" \
+        "/opt/maven"
+    do
+        if [ -d "$candidate/boot" ]; then
+            MVN_HOME="$candidate"
+            break
+        fi
+    done
+fi
+
+if [ -z "$MVN_HOME" ] || [ ! -d "$MVN_HOME/boot" ]; then
+    echo "[mvnw] 找不到可用的 Maven 安装目录。" >&2
+    echo "[mvnw] 请设置环境变量 MAVEN_HOME 指向 Maven 根目录后重试。" >&2
+    exit 1
+fi
+
+# ---- 2. 定位 classworlds 启动器 jar ----
+CLASSWORLDS=""
+for jar in "$MVN_HOME"/boot/plexus-classworlds-*.jar; do
+    if [ -f "$jar" ]; then
+        CLASSWORLDS="$jar"
+        break
+    fi
+done
+
+if [ -z "$CLASSWORLDS" ]; then
+    echo "[mvnw] 在 $MVN_HOME/boot 下找不到 plexus-classworlds-*.jar" >&2
+    exit 1
+fi
+
+# ---- 3. 用 java 启动 Maven ----
+exec java \
+    -classpath "$CLASSWORLDS" \
+    "-Dclassworlds.conf=$MVN_HOME/bin/m2.conf" \
+    "-Dmaven.home=$MVN_HOME" \
+    "-Dmaven.multiModuleProjectDirectory=$(pwd)" \
+    "-Dlibrary.jansi.path=$MVN_HOME/lib/jansi-native" \
+    org.codehaus.plexus.classworlds.launcher.Launcher "$@"

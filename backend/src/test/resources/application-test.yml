@@ -1,0 +1,38 @@
+# ============================================================================
+#  测试环境配置
+#
+#  目的：在没有 MySQL 的情况下，也能验证「HTTP 接口契约」是否正确 ——
+#  包括状态码、JSON 字段命名（snake_case）、错误响应格式（{"detail": ...}）。
+#
+#  做法：把数据源相关的自动配置全部排除掉，改用 Mockito 提供的仓储替身。
+#  这样测试不依赖任何外部服务，也能完整跑通
+#  「Spring Security 过滤器链 + Controller + Service + Jackson 序列化」这一整条链路。
+# ============================================================================
+
+spring:
+  # 排除数据源 / JPA 自动配置：
+  # · 排除后不会尝试连接 MySQL，测试可以在任何机器上跑
+  # · UserRepository 由测试里的 @MockitoBean 提供，Spring 容器依然能装配成功
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.jpa.JpaRepositoriesAutoConfiguration
+  # 建表脚本同样依赖数据源，一并关掉
+  sql:
+    init:
+      mode: never
+
+app:
+  security:
+    # 测试用固定密钥。注意长度 >= 32 字节，避免每一步都走 SHA-256 规整分支，
+    # 让测试覆盖到「密钥足够长时原样使用」这条主路径。
+    secret-key: test-secret-key-for-contract-verification-only
+    algorithm: HS256
+    access-token-expire-minutes: 60
+
+logging:
+  level:
+    root: WARN
+    com.ipas.assistant: INFO
+    org.springframework.web: WARN

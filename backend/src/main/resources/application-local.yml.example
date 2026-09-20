@@ -1,0 +1,30 @@
+# ============================================================================
+#  本地私有配置模板
+#
+#  用法：复制本文件为 application-local.yml，填入你自己的值。
+#  application-local.yml 已被 .gitignore 排除，不会提交到仓库。
+#
+#    cp application-local.yml.example application-local.yml
+# ============================================================================
+
+spring:
+  datasource:
+    # characterEncoding 用 Java 字符集名 UTF-8（不是 MySQL 的 utf8mb4）；
+    # connectionTimeZone + preserveInstants 用来禁止驱动做时区转换（详见 application.yml 的注释）
+    url: jdbc:mysql://127.0.0.1:3306/ipas_assistant?useUnicode=true&characterEncoding=UTF-8&connectionTimeZone=LOCAL&preserveInstants=false&allowPublicKeyRetrieval=true&useSSL=false
+    username: root
+    # 改成你本机 MySQL 的密码
+    password: ""
+
+app:
+  llm:
+    # ollama = 本地推理（需先启动 Ollama）；cloud = 云端 OpenAI 兼容平台
+    provider: ollama
+    cloud:
+      # 云端模型的 Key 与端点，例如阿里云百炼 / 智谱 / DeepSeek
+      api-key: ""
+      base-url: ""
+      model: ""
+  tools:
+    # 高德地图 Key：天气查询首选（中文城市名，国内访问稳定）
+    amap-api-key: ""

@@ -1,0 +1,4 @@
+# 后端构建上下文忽略：只保留 target/（含要 COPY 的可执行 jar）与 Dockerfile 本身，
+# 排除 git 元数据与含密码的本地配置，避免被拷进镜像构建上下文。
+.git
+application-local.yml
