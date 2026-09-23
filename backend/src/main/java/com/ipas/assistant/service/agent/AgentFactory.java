@@ -9,6 +9,7 @@ import com.ipas.assistant.common.ApiException;
 import com.ipas.assistant.common.SystemPrompts;
 import com.ipas.assistant.config.AppProperties;
 import com.ipas.assistant.entity.Conversation;
+import com.ipas.assistant.common.PromptGuard;
 import com.ipas.assistant.entity.LlmProvider;
 import com.ipas.assistant.entity.Skill;
 import com.ipas.assistant.repository.ConversationRepository;
@@ -137,8 +138,6 @@ public class AgentFactory {
  Conversation conv = conversationRepository.findByIdAndUserId(conversationId, userId)
  .orElseThrow(() -> ApiException.notFound("会话不存在"));
 
- RuntimeSettingsService.LlmSettings settings = settingsService.load(userId);
-
  // ---- 解析「已启用的技能」----
  // 三个条件缺一不可：属于本用户、is_enabled=true、id 在会话勾选的集合内。
  // 少了 is_enabled 的过滤，用户「关闭」某个技能后它依然生效。
@@ -150,40 +149,12 @@ public class AgentFactory {
  // ---- 解析知识库集合（RAG 工具已接入，kbIds 既参与缓存键，也决定 search_knowledge_base 的检索范围）----
  List<Long> kbIds = conv.getActiveKbIds() == null ? List.of() : conv.getActiveKbIds();
 
- // ---- 解析模型凭据：优先会话指定的 provider，否则回落默认配置 ----
- // 这一段对应的多 API 兜底链：会话指定 → 全局默认 → 第一个已接入的平台。
- String provider = conv.getProvider() == null ? "" : conv.getProvider();
- String model = conv.getModel();
- LlmProvider providerRow = null;
- if (conv.getProviderId() != null) {
- providerRow = providerRepository
- .findByIdAndUserId(conv.getProviderId(), userId)
- .orElse(null);
- }
- if (providerRow == null && !"ollama".equalsIgnoreCase(provider)
- && settings.apiKey().isBlank()) {
- // 旧会话没指定 provider，且默认云端凭据也已清空 → 兜底用第一个已接入的平台，
- // 保证老会话仍然可用（早期设计同样有这段兜底）
- providerRow = providerRepository.findFirstByUserIdOrderByIdAsc(userId).orElse(null);
- }
- if (providerRow != null) {
- provider = "cloud";
- if (model == null || model.isBlank()) {
- model = providerRow.getModel();
- }
- } else if (model == null || model.isBlank()) {
- model = "ollama".equalsIgnoreCase(provider)
- ? properties.llm().ollama().model()
- : settings.model();
- }
-
- boolean thinking = provider != null && !"ollama".equalsIgnoreCase(provider)
- && Boolean.TRUE.equals(enableThinking);
- int budget = thinking && thinkingBudget != null ? Math.max(0, thinkingBudget) : 0;
+ // ---- 解析模型与凭据（与「确定性知识问答」链路共用同一套规则，见 resolveModel）----
+ ResolvedModel rm = resolveModel(conv, userId, enableThinking, thinkingBudget);
 
  // ---- 缓存查找 ----
- AgentCache.Key key = AgentCache.keyOf(conversationId, provider, model,
- activeSkills.stream().map(Skill::getId).toList(), kbIds, thinking, budget,
+ AgentCache.Key key = AgentCache.keyOf(conversationId, rm.provider(), rm.model(),
+ activeSkills.stream().map(Skill::getId).toList(), kbIds, rm.thinking(), rm.thinkingBudget(),
  conv.getProviderId());
  Object cached = cache.get(key);
  if (cached instanceof ReactAgent agent) {
@@ -191,15 +162,10 @@ public class AgentFactory {
  }
 
  // ---- 构建 ----
- ChatModel chatModel = modelFactory.create(
- provider, model,
- providerRow == null ? null : providerRow.getApiKey(),
- providerRow == null ? null : providerRow.getBaseUrl(),
- thinking ? Boolean.TRUE : null,
- budget > 0 ? budget : null,
- settings);
-
- String systemPrompt = SystemPrompts.BASE;
+ // 基础提示词 + 注入防护规则。
+ // 为什么这里也要加：Agent 链路会把用户上传的附件正文拼进用户消息，
+ // 那同样是不可信输入（有人可以在文档里写"忽略以上指令"）。
+ String systemPrompt = SystemPrompts.BASE + "\n\n" + PromptGuard.RULE;
  if (!activeSkills.isEmpty()) {
  systemPrompt = SystemPrompts.withSkills(systemPrompt, activeSkills.stream()
  .map(s -> new SystemPrompts.SkillPrompt(
@@ -209,7 +175,7 @@ public class AgentFactory {
 
  Builder agentBuilder = ReactAgent.builder()
  .name("ipas-assistant")
- .model(chatModel)
+ .model(rm.chatModel())
  .tools(tools.forUser(userId, kbIds, conversationId))
  .systemPrompt(systemPrompt)
  // 记忆：全局共享的 MysqlSaver。thread_id 由调用方在 RunnableConfig 里传，
@@ -228,7 +194,7 @@ public class AgentFactory {
  AppProperties.History history = properties.history();
  if (history != null && history.summaryMaxTokens() > 0) {
  SummarizationHook compression = SummarizationHook.builder()
- .model(chatModel) // 摘要复用同一模型（原文也是）
+ .model(rm.chatModel()) // 摘要复用同一模型（早期实现也是）
  .tokenCounter(TokenCounter.approximateMsgCounter()) // 官方按字符数估算 token
  .messagesToKeep(Math.max(2, history.keepRecent())) // 最近 N 条保留原文
  .maxTokensBeforeSummary(history.summaryMaxTokens()) // 超过该 token 才启动压缩
@@ -244,7 +210,83 @@ public class AgentFactory {
 
  cache.put(key, agent);
  log.info("已构建 Agent：会话={} provider={} model={} 技能={} 知识库={} 思考={}",
- conversationId, provider, model, key.skillIds(), key.kbIds(), thinking);
+ conversationId, rm.provider(), rm.model(), key.skillIds(), key.kbIds(), rm.thinking());
  return agent;
+ }
+
+ /**
+ * 解析某会话最终要使用的模型与凭据。
+ *
+ * <h2>为什么把它从 {@link #forConversation} 里抽出来</h2>
+ *
+ * <p>模型凭据的解析有一套不短的兜底链（会话指定的接入平台 → 全局默认云端凭据 →
+ * 第一个已接入的平台 → 本地 Ollama），而且涉及「providerId 指向的行属于本用户」
+ * 这类安全约束。除了构建 Agent，<b>「确定性知识问答」链路也要用同一个模型</b>
+ * （它不走 Agent、直接调模型生成答案）。
+ *
+ * <p>如果那条链路自己再写一遍凭据解析，两边一旦走岔，就会出现
+ * 「Agent 能连上模型、知识问答却报未配置」这种极难定位的问题。
+ * 所以这里做成公开方法，两条链路共用同一份规则。
+ *
+ * <p>刻意<b>不加</b> {@code @Transactional}：它只读不写（仓储自身的读方法已带事务），
+ * 加在这里反而带来"同类自调用不走代理"的隐患。
+ */
+ public ResolvedModel resolveModel(Conversation conv, Long userId,
+ Boolean enableThinking, Integer thinkingBudget) {
+ RuntimeSettingsService.LlmSettings settings = settingsService.load(userId);
+
+ // ---- 解析模型凭据：优先会话指定的 provider，否则回落默认配置 ----
+ // 多 API 兜底链：会话指定 → 全局默认 → 第一个已接入的平台。
+ String provider = conv.getProvider() == null ? "" : conv.getProvider();
+ String model = conv.getModel();
+ LlmProvider providerRow = null;
+ if (conv.getProviderId() != null) {
+ providerRow = providerRepository
+ .findByIdAndUserId(conv.getProviderId(), userId)
+ .orElse(null);
+ }
+ if (providerRow == null && !"ollama".equalsIgnoreCase(provider)
+ && settings.apiKey().isBlank()) {
+ // 旧会话没指定 provider，且默认云端凭据也已清空 → 兜底用第一个已接入的平台，
+ // 保证老会话仍然可用（早期实现同样有这段兜底）
+ providerRow = providerRepository.findFirstByUserIdOrderByIdAsc(userId).orElse(null);
+ }
+ if (providerRow != null) {
+ provider = "cloud";
+ if (model == null || model.isBlank()) {
+ model = providerRow.getModel();
+ }
+ } else if (model == null || model.isBlank()) {
+ model = "ollama".equalsIgnoreCase(provider)
+ ? properties.llm().ollama().model()
+ : settings.model();
+ }
+
+ boolean thinking = provider != null && !"ollama".equalsIgnoreCase(provider)
+ && Boolean.TRUE.equals(enableThinking);
+ int budget = thinking && thinkingBudget != null ? Math.max(0, thinkingBudget) : 0;
+
+ ChatModel chatModel = modelFactory.create(
+ provider, model,
+ providerRow == null ? null : providerRow.getApiKey(),
+ providerRow == null ? null : providerRow.getBaseUrl(),
+ thinking ? Boolean.TRUE : null,
+ budget > 0 ? budget : null,
+ settings);
+
+ return new ResolvedModel(chatModel, provider, model, thinking, budget);
+ }
+
+ /**
+ * 会话解析出的模型与凭据。
+ *
+ * @param chatModel 可直接调用的模型
+ * @param provider {@code ollama} 或 {@code cloud}（落库 / SSE done 事件要带上）
+ * @param model 实际使用的模型名
+ * @param thinking 是否启用了云端深度思考（Agent 缓存键的维度之一）
+ * @param thinkingBudget 思维链上限，0 表示用平台默认
+ */
+ public record ResolvedModel(ChatModel chatModel, String provider, String model,
+ boolean thinking, int thinkingBudget) {
  }
 }

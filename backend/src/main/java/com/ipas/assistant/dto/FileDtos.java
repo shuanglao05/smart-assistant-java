@@ -17,15 +17,29 @@ public final class FileDtos {
  private FileDtos() {
  }
 
- /** 文件列表项 / 上传成功返回。对应 {@code FileOut}。 */
+ /**
+ * 文件列表项 / 上传成功返回。对应 {@code FileOut}。
+ *
+ * <p>带上了索引状态三件套：因为上传已改为"落库即返回、后台异步索引"，
+ * 上传成功的响应里状态通常是 {@code PENDING}，前端需要据此显示"索引中 / 已就绪 / 失败"
+ * 并决定是否轮询。多出字段对既有前端是无害的（多余字段会被忽略）。
+ *
+ * @param indexStatus PENDING / INDEXING / READY / FAILED / SKIPPED
+ * @param chunkCount  已生成的索引片段数
+ * @param indexError  索引失败原因；未失败为 null
+ */
  public record FileOut(
  Long id,
  String filename,
  Long size,
- LocalDateTime createdAt
+ LocalDateTime createdAt,
+ String indexStatus,
+ Integer chunkCount,
+ String indexError
  ) {
  public static FileOut from(FileItem f) {
- return new FileOut(f.getId(), f.getFilename(), f.getSize(), f.getCreatedAt());
+ return new FileOut(f.getId(), f.getFilename(), f.getSize(), f.getCreatedAt(),
+ f.getIndexStatus(), f.getChunkCount(), f.getIndexError());
  }
  }
 

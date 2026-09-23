@@ -267,3 +267,34 @@ export interface NotificationItem {
  is_read: boolean
  created_at: string
 }
+
+/**
+ * 一轮回答的单个「执行阶段」（来自 GET /sessions/{sid}/messages/{mid}/trace）。
+ *
+ * stage 取值：PREPARE（准备）/ ROUTE（路由）/ RETRIEVE（检索）/
+ * AGENT_BUILD（构建 Agent）/ FIRST_TOKEN（首字延迟）/ DONE（总耗时）。
+ * 注意 FIRST_TOKEN 与 DONE 的 duration_ms 是【累计值】（从请求开始算），
+ * 其余阶段是各自的独立耗时 —— 展示时要分清，别当成同一口径。
+ */
+export interface TraceStage {
+ stage: string
+ duration_ms: number
+ /** 提示词侧 token 估算值；Agent 链路拿不到则为 null */
+ prompt_tokens: number | null
+ /** 回答侧 token 估算值 */
+ completion_tokens: number | null
+ /** 阶段补充信息（路由结果 / 命中片段数 / 模型名等） */
+ detail: string | null
+ created_at: string | null
+}
+
+/** 一轮回答的完整执行时间线。stages 为空表示这一轮没有记录（如服务重启前的历史消息）。 */
+export interface TraceTimeline {
+ session_id: number
+ message_id: number
+ /** 总耗时（取自 DONE 阶段） */
+ total_ms: number
+ /** 首字延迟：从请求开始到第一个正文 token */
+ first_token_ms: number
+ stages: TraceStage[]
+}

@@ -1,7 +1,6 @@
 package com.ipas.assistant.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ipas.assistant.common.ApiException;
 import com.ipas.assistant.config.AppProperties;
 import com.ipas.assistant.dto.KbDtos;
@@ -13,15 +12,16 @@ import com.ipas.assistant.repository.KbChunkRepository;
 import com.ipas.assistant.repository.KbCollectionRepository;
 import com.ipas.assistant.service.rag.EmbeddingService;
 import com.ipas.assistant.service.rag.TextSplitter;
+import com.ipas.assistant.service.rag.Vectors;
+import com.ipas.assistant.service.rag.VectorIndexPort;
+import com.ipas.assistant.service.storage.FileStoragePort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -62,9 +62,26 @@ public class KbService {
  private final EmbeddingService embeddingService;
  private final AppProperties properties;
  private final RuntimeSettingsService settingsService;
- private final ObjectMapper objectMapper;
- /** 数据目录的唯一来源（不可直接读 AppProperties，否则迁移后会读错目录）。 */
- private final DataDirProvider dataDirProvider;
+ /**
+ * 文件存储端口（见 {@code FileStoragePort}）。
+ *
+ * <p>本类需要删文件（删除知识库要把它下面的文档一起删掉），
+ * 但<b>不该因此依赖磁盘</b>：换成对象存储后，"删文件"仍是同一个调用。
+ * 解耦之后本类也不再碰 {@code java.nio.file}，可以在纯内存里单测。
+ */
+ private final FileStoragePort fileStorage;
+
+ /**
+ * 外部向量索引（可选）。
+ *
+ * <p>用 {@link ObjectProvider} 而不是直接注入：该端口<b>只在
+ * {@code app.rag.vector-store=pgvector} 时才存在</b>，直接注入会让默认（mysql）模式下的
+ * 应用启动失败 —— "可选依赖"必须在类型层面就是可选的。
+ *
+ * <p>拿到 null（未启用）或 {@code available()=false}（PG 没起）都直接跳过：
+ * 向量索引是可重建的派生物，MySQL 里的片段才是真相源。
+ */
+ private final ObjectProvider<VectorIndexPort> vectorIndexProvider;
 
  public KbService(KbCollectionRepository collectionRepository,
  KbChunkRepository chunkRepository,
@@ -72,16 +89,16 @@ public class KbService {
  EmbeddingService embeddingService,
  AppProperties properties,
  RuntimeSettingsService settingsService,
- ObjectMapper objectMapper,
- DataDirProvider dataDirProvider) {
+ FileStoragePort fileStorage,
+ ObjectProvider<VectorIndexPort> vectorIndexProvider) {
  this.collectionRepository = collectionRepository;
  this.chunkRepository = chunkRepository;
  this.fileRepository = fileRepository;
  this.embeddingService = embeddingService;
  this.properties = properties;
  this.settingsService = settingsService;
- this.objectMapper = objectMapper;
- this.dataDirProvider = dataDirProvider;
+ this.fileStorage = fileStorage;
+ this.vectorIndexProvider = vectorIndexProvider;
  }
 
  // ==================================================================
@@ -281,7 +298,11 @@ public class KbService {
  "嵌入服务不可用（Ollama 未启动或未加载 bge-m3），索引失败");
  }
 
- // ③ 逐片段落库（向量序列化成 JSON 文本，与早期设计 json.dumps 同构，可复用）
+ // ③ 逐片段落库（向量存 float32 二进制：比 JSON 文本小约 4.5 倍，
+ // 且读取时是一次内存拷贝而非文本解析 —— 后者才是检索慢的主因）。
+ // 旧版 embedding(JSON) 列不再写入；历史数据的读取兼容由 RagService 负责。
+ // 顺带收集"待同步到外部向量库"的点（只有启用 pgvector 时才真正用到）
+ List<VectorIndexPort.VectorPoint> points = new ArrayList<>(chunks.size());
  for (int i = 0; i < chunks.size(); i++) {
  KbChunk ch = new KbChunk();
  ch.setUserId(userId);
@@ -289,10 +310,32 @@ public class KbService {
  ch.setFileId(fileId);
  ch.setChunkIndex(i);
  ch.setText(chunks.get(i));
- ch.setEmbedding(vectorsToJson(vectors[i]));
- chunkRepository.save(ch);
+ ch.setEmbeddingBin(Vectors.toBytes(vectors[i]));
+ KbChunk saved = chunkRepository.save(ch);
+ // id 必须取自保存后的实体：自增主键在 save 之后才有值，
+ // 而外部向量库正是按这个 id 关联 MySQL 里的片段。
+ points.add(new VectorIndexPort.VectorPoint(saved.getId(), userId, collectionId, fileId, vectors[i]));
  }
+ syncVectorIndex(userId, fileId, points);
  return chunks.size();
+ }
+
+ /**
+ * 把片段向量同步到外部向量库（尽力而为，绝不影响索引流程本身）。
+ *
+ * <p>为什么"失败也不报错"：向量库是可重建的派生物（真相源是 MySQL 的 kb_chunks，
+ * 更源头是磁盘上的原始文件）。写不进去最多让这次检索退化成 MySQL 路径，
+ * 不该反过来让"上传 / 重建索引"失败。
+ */
+ private void syncVectorIndex(Long userId, Long fileId, List<VectorIndexPort.VectorPoint> points) {
+ VectorIndexPort index = vectorIndexProvider.getIfAvailable();
+ if (index == null || !index.available()) {
+ return;
+ }
+ // 先删该文档的旧向量再写：重新索引会换掉全部片段 id，
+ // 不先删就会留下永远查不到的孤儿向量（读取时会跳过，但白占空间）。
+ index.deleteByFile(userId, fileId);
+ index.upsert(points);
  }
 
  // 注意：「重建全部」**不在本类实现** —— 已移到 {@code FileService#reindexAll}。
@@ -337,35 +380,13 @@ public class KbService {
  // 内部辅助
  // ==================================================================
 
- /** 把单条向量序列化成 JSON 文本（如 {@code [0.0123,-0.456,...]}）。 */
- private String vectorsToJson(float[] vec) {
- try {
- return objectMapper.writeValueAsString(vec);
- } catch (Exception e) {
- // 序列化不该失败（float 数组必然可序列化）；兜底用裸拼接，绝不能让索引整体中断
- log.warn("向量序列化失败，改用裸拼接：{}", e.getMessage());
- StringBuilder sb = new StringBuilder("[");
- for (int i = 0; i < vec.length; i++) {
- if (i > 0) {
- sb.append(',');
- }
- sb.append(vec[i]);
- }
- sb.append("]");
- return sb.toString();
- }
- }
-
- /** 删除磁盘上的原始文件（stored_path 是相对 dataDir 的路径，如 uploads/u1/xxx.md）。 */
+ /** 删除原始文件（交给存储端口；失败不影响删除流程本身）。 */
  private void deleteDiskFile(FileItem f) {
  try {
  if (f.getStoredPath() == null) {
  return;
  }
- Path p = dataDirProvider.resolveStored(f.getStoredPath());
- if (Files.exists(p)) {
- Files.delete(p);
- }
+ fileStorage.delete(f.getStoredPath());
  } catch (Exception e) {
  log.warn("删除磁盘文件失败（已忽略）：{}", e.getMessage());
  }

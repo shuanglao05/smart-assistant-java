@@ -1,19 +1,21 @@
 package com.ipas.assistant.service;
 
 import com.ipas.assistant.common.ApiException;
+import com.ipas.assistant.common.FileIndexRequested;
+import com.ipas.assistant.common.IndexStatus;
 import com.ipas.assistant.config.AppProperties;
 import com.ipas.assistant.dto.FileDtos;
 import com.ipas.assistant.dto.KbDtos;
 import com.ipas.assistant.entity.FileItem;
 import com.ipas.assistant.repository.FileItemRepository;
 import com.ipas.assistant.repository.KbChunkRepository;
-// KbService 与 FileService 同属 com.ipas.assistant.service 包，无需 import：
-// 写入侧 FileService 依赖 KbService.indexFile 完成「上传即入库」的语义块落库。
+import com.ipas.assistant.service.storage.FileStoragePort;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.multipart.MultipartFile;
@@ -21,14 +23,10 @@ import org.springframework.web.multipart.MultipartFile;
 import javax.xml.parsers.DocumentBuilderFactory;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.UUID;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
@@ -45,16 +43,20 @@ import java.util.zip.ZipInputStream;
  * <li>文本 / 代码 / markdown：直接 UTF-8 解码（含 BOM 剥离）；</li>
  * <li>Word(.docx)：用 JDK 自带的 {@code java.util.zip} + DOM 解析 {@code word/document.xml}，
  * 零依赖，与 早期实现思路一致；</li>
- * <li>PDF：<b>当前版本未引入解析库（Apache PDFBox），离线构建也加不了新依赖</b>，
- * 故返回空正文、不进索引（行为等价于"扫描版 PDF 没抽到文本"）。待联网环境接入
- * PDFBox 后，只需替换 {@link #extractText} 里 PDF 分支即可，上层无需改动；</li>
- * <li>图片：不抽正文，交给多模态模型直接看图，content 置空。</li>
+ * <li>PDF：用 Apache PDFBox 3.x 抽取（{@code Loader.loadPDF} + {@code PDFTextStripper}）。
+ * 扫描版 PDF（内容其实是图片）抽不到文字，返回空正文、自然不入索引；</li>
+ * <li>图片：不抽正文，交给多模态模型直接看图，content 置空，索引状态标 SKIPPED。</li>
  * </ul>
  *
- * <h2>上传即建索引，但失败不影响上传</h2>
- * 与此前行为一致：上传成功后立刻调 {@link KbService#indexFile} 建立向量索引；
- * 索引失败（如 Ollama 没开）<b>只记日志、不抛异常</b>，上传本身照样成功返回 ——
- * 否则"模型没起"就会让用户连文件都传不上去。重索引接口则会如实把失败暴露给用户。
+ * <h2>索引异步执行（本类最重要的行为约定）</h2>
+ * 上传<b>不再</b>在本方法里同步建索引，而是「落盘 + 落库 + 发布事件」后立即返回，
+ * 真正的切分 / 向量化由 {@code KnowledgeIndexWorker} 在事务提交后的后台线程池执行，
+ * 并把进度写进 {@code files.index_status}。这样上传接口的响应时间与文档大小无关，
+ * 不会因大文档同步索引而超时。
+ *
+ * <p>失败也不再影响上传本身：索引异常只会让该文件停在 FAILED（含原因，可重试），
+ * 上传记录依然有效 —— 否则"嵌入服务没起"会让用户连文件都传不上去。
+ * 而「重建索引」是用户显式发起的操作，走另一条同步路径，会如实把失败抛给用户。
  */
 @Service
 public class FileService {
@@ -84,24 +86,34 @@ public class FileService {
  private final KbService kbService;
  private final AppProperties properties;
  /**
- * 数据目录的唯一来源。
+ * 文件存储端口：本类只负责"存进去 / 取出来 / 删掉"，
+ * <b>不认识磁盘、也不认识任何对象存储</b>。默认实现落在本地磁盘（见 LocalFileStorage），
+ * 以后要接对象存储只需换实现，本类一行都不用改。
  *
- * <p><b>不要直接读 {@code AppProperties.dataDir()}</b> —— 那个是启动时的默认值，
- * 用户在设置页迁移数据目录后不会变。所有磁盘路径一律问 {@code DataDirProvider}，
- * 否则会出现"文件存到新目录、却还去旧目录读"的不一致。
+ * <p>注意：具体实现内部仍然通过 {@code DataDirProvider} 解析数据目录 ——
+ * 数据目录是运行时可改的，任何地方都不能绕过它去直读配置。
  */
- private final DataDirProvider dataDirProvider;
+ private final FileStoragePort fileStorage;
+
+ /**
+ * 事件发布器：上传后并不在本方法里同步索引，而是发布一个
+ * {@link FileIndexRequested}，由 {@code KnowledgeIndexWorker} 在
+ * 「本事务提交之后」于后台线程池里执行。原因见 {@link #upload} 的注释。
+ */
+ private final ApplicationEventPublisher eventPublisher;
 
  public FileService(FileItemRepository fileRepository,
  KbChunkRepository chunkRepository,
  KbService kbService,
  AppProperties properties,
- DataDirProvider dataDirProvider) {
+ FileStoragePort fileStorage,
+ ApplicationEventPublisher eventPublisher) {
  this.fileRepository = fileRepository;
  this.chunkRepository = chunkRepository;
  this.kbService = kbService;
  this.properties = properties;
- this.dataDirProvider = dataDirProvider;
+ this.fileStorage = fileStorage;
+ this.eventPublisher = eventPublisher;
  }
 
  // ==================================================================
@@ -131,7 +143,10 @@ public class FileService {
  // ==================================================================
 
  /**
- * 上传文件：存盘 + 抽正文 + （非图片/PDF）上传即建索引。
+ * 上传文件：存盘 + 抽正文 + （可索引的文件）投递后台索引任务。
+ *
+ * <p>本方法<b>不做</b>向量化，因此响应时间与文档大小无关：落库后立即返回，
+ * 可索引的文件初始状态为 {@code PENDING}，由后台线程池接管（见类注释）。
  *
  * @param collectionId 归属知识库；null = 仅聊天附件
  */
@@ -170,25 +185,20 @@ public class FileService {
  properties.upload().maxMb()));
  }
 
- // 落盘：dataDir/uploads/u{userId}/{uuid}{ext}
- Path userDir = uploadRoot().resolve("u" + userId);
+ // 落盘：交给存储端口（本地实现落在 dataDir/uploads/u{userId}/ 下）。
+ // 它返回的"相对路径"会原样存进 files.stored_path —— 语义与历史数据完全一致，
+ // 保证整个数据目录搬走之后记录依然有效。
+ String relativeStored;
  try {
- Files.createDirectories(userDir);
- } catch (Exception e) {
- throw ApiException.badRequest("创建上传目录失败：" + e.getMessage());
- }
- String storedName = UUID.randomUUID().toString().replace("-", "") + ext;
- Path storedPath = userDir.resolve(storedName);
- try {
- Files.write(storedPath, data);
+ relativeStored = fileStorage.put(userId, name, data);
  } catch (Exception e) {
  throw ApiException.badRequest("保存上传文件失败：" + e.getMessage());
  }
- // stored_path 存相对 dataDir 的路径，便于整目录迁移（与早期设计一致）
- String relativeStored = "uploads/u" + userId + "/" + storedName;
 
  // 抽正文（图片不抽；PDF 用 PDFBox；docx 用 zip+XML；其余按文本读取），并按上限截断
  String content = extractBody(data, ext);
+
+ boolean indexable = isIndexable(ext);
 
  FileItem item = new FileItem();
  item.setUserId(userId);
@@ -197,16 +207,22 @@ public class FileService {
  item.setStoredPath(relativeStored);
  item.setSize((long) data.length);
  item.setContent(content);
+ // 索引状态在这里定好：可索引 = 等后台处理（PENDING）；图片等没有正文的文件 = SKIPPED。
+ // 不给图片留 PENDING，是为了避免它永远停在"等待索引"，让前端一直显示"索引中"。
+ item.setIndexStatus(indexable ? IndexStatus.PENDING : IndexStatus.SKIPPED);
+ item.setChunkCount(0);
  FileItem saved = fileRepository.save(item);
  fileRepository.flush();
 
- // 上传即建立 RAG 索引（切分+向量化）。图片不进库；失败不影响上传本身。
- if (isIndexable(ext)) {
- try {
- kbService.indexFile(userId, saved.getId(), content, collectionId);
- } catch (Exception e) {
- log.warn("上传文件 {} 后建立索引失败（已忽略，不影响上传）：{}", saved.getId(), e.getMessage());
- }
+ // ★ 关键改动：索引不再在本方法里同步执行。
+ // 同步跑的问题：一份上限 50 万字符的文档会切成约 1000 个片段、分 32 批调用嵌入服务，
+ // 耗时几十秒到几分钟；上传请求会一直挂着，浏览器 / 网关的短超时先一步把它掐断 ——
+ // 用户看到"上传失败"，可文件其实已经存进去了，非常容易误解。
+ // 所以本方法只负责「落盘 + 落库 + 立即返回」，索引交给事务提交后的后台线程池：
+ //   · 用事件而不是直接调用，是为了让框架保证"事务已提交"这个前提（见 FileIndexRequested）；
+ //   · 后台线程会自行回查文件、更新 index_status，前端据此显示进度。
+ if (indexable) {
+ eventPublisher.publishEvent(new FileIndexRequested(userId, saved.getId(), collectionId));
  }
  return saved;
  }
@@ -254,6 +270,11 @@ public class FileService {
  // 把重新抽到的正文写回：否则 files.content 会一直停留在旧值
  // （例如历史上 docx 抽取失败时存下的兜底文本），与刚重建好的 kb_chunks 对不上。
  item.setContent(content);
+ // 同步重建成功后一并刷新索引状态：片段数与状态必须和 kb_chunks 的实际内容一致，
+ // 否则界面会出现"显示已索引 0 段，实际能检索到内容"这类对不上的情况。
+ item.setIndexStatus(IndexStatus.READY);
+ item.setIndexError(null);
+ item.setChunkCount(n);
  fileRepository.save(item);
  return item;
  }
@@ -290,8 +311,12 @@ public class FileService {
  int n = kbService.indexFile(userId, f.getId(), content, f.getCollectionId());
  if (n > 0) {
  indexed++;
- // 与单文件重建一致：把新抽到的正文写回，避免 content 与 chunks 长期不一致
+ // 与单文件重建一致：把新抽到的正文写回，避免 content 与 chunks 长期不一致；
+ // 同时刷新索引状态与片段数，保证状态列始终反映真实索引结果。
  f.setContent(content);
+ f.setIndexStatus(IndexStatus.READY);
+ f.setIndexError(null);
+ f.setChunkCount(n);
  fileRepository.save(f);
  } else {
  failed++;
@@ -430,24 +455,19 @@ public class FileService {
  }
 
  // ==================================================================
- // 磁盘 / 工具
+ // 存储 / 工具
  // ==================================================================
 
- private Path uploadRoot() {
- return dataDirProvider.uploadsDir();
- }
-
- /** 从磁盘读回原文（重索引用）。文件缺失直接报错提示用户。 */
+ /** 从存储读回原文（重索引用）。文件缺失直接报错提示用户。 */
  private byte[] readDisk(FileItem f) {
  try {
  if (f.getStoredPath() == null) {
  throw new IllegalStateException("存储路径缺失");
  }
- Path p = dataDirProvider.resolveStored(f.getStoredPath());
- if (!Files.exists(p)) {
+ if (!fileStorage.exists(f.getStoredPath())) {
  throw new IllegalStateException("磁盘文件不存在");
  }
- return Files.readAllBytes(p);
+ return fileStorage.get(f.getStoredPath());
  } catch (Exception e) {
  throw ApiException.badRequest("读取磁盘文件失败：" + e.getMessage());
  }
@@ -458,10 +478,7 @@ public class FileService {
  if (f.getStoredPath() == null) {
  return;
  }
- Path p = dataDirProvider.resolveStored(f.getStoredPath());
- if (Files.exists(p)) {
- Files.delete(p);
- }
+ fileStorage.delete(f.getStoredPath());
  } catch (Exception e) {
  log.warn("删除磁盘文件失败（已忽略）：{}", e.getMessage());
  }

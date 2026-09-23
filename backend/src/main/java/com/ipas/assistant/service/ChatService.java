@@ -11,15 +11,19 @@ import com.ipas.assistant.entity.Message;
 import com.ipas.assistant.repository.ConversationRepository;
 import com.ipas.assistant.repository.MessageRepository;
 import com.ipas.assistant.service.agent.AgentFactory;
+import com.ipas.assistant.service.agent.ChatModeRouter;
+import com.ipas.assistant.service.agent.KbQaService;
 import com.ipas.assistant.service.agent.ThinkSplitter;
 import com.ipas.assistant.service.memory.ConversationMemoryPort;
 import com.ipas.assistant.service.rag.RagSourcesBus;
+import com.ipas.assistant.service.trace.ChatTraceService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.messages.MessageType;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.context.annotation.Profile;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
@@ -30,6 +34,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -92,12 +97,39 @@ public class ChatService {
  /** 首轮自动命名取用户消息的前 N 个字作为会话标题（与早期设计一致）。 */
  private static final int TITLE_MAX_LEN = 20;
 
+ /**
+ * 会话级"生成中"互斥闸门：同一会话同时只允许一条流（设计说明见该类注释）。
+ *
+ * <p>互斥状态、超时接管与清扫逻辑都封装在它里面；本类只负责在正确的时机调用 ——
+ * 进入时 {@code acquire}，三条收尾路径（正常 / 异常 / 断连超时）以及"同步阶段失败"时
+ * {@code release}。这样那段纯逻辑就能独立单测，不必依赖真实模型与数据库。
+ */
+ private final ConversationStreamGuard streamGuard;
+
  private final ConversationRepository conversationRepository;
  private final MessageRepository messageRepository;
  private final AgentFactory agentFactory;
  private final RuntimeSettingsService settingsService;
  private final ConversationMemoryPort memory;
  private final RagSourcesBus ragSourcesBus;
+
+ /**
+ * 执行模式路由：决定这一轮走"确定性知识问答"还是"开放式 Agent"。
+ * 判据是纯逻辑、可单测，见 {@link ChatModeRouter}。
+ */
+ private final ChatModeRouter chatModeRouter;
+
+ /**
+ * 确定性知识问答链路：先检索、再把带编号的证据交给模型生成（见 {@link KbQaService}）。
+ * 检索不到证据时会返回空，由本类回退到 Agent 路径。
+ */
+ private final KbQaService kbQaService;
+
+ /**
+ * 执行过程记录（可观测性）：把这一轮的阶段耗时、首字延迟、token 估算写进 chat_traces。
+ * 写入失败会被它自己吞掉，绝不影响对话。
+ */
+ private final ChatTraceService traceService;
 
  /**
  * 指向<b>自己的 Spring 代理</b>（自注入）。
@@ -132,6 +164,10 @@ public class ChatService {
  RuntimeSettingsService settingsService,
  ConversationMemoryPort memory,
  RagSourcesBus ragSourcesBus,
+ ChatModeRouter chatModeRouter,
+ KbQaService kbQaService,
+ ChatTraceService traceService,
+ ConversationStreamGuard streamGuard,
  @Lazy ChatService self) {
  this.conversationRepository = conversationRepository;
  this.messageRepository = messageRepository;
@@ -139,6 +175,10 @@ public class ChatService {
  this.settingsService = settingsService;
  this.memory = memory;
  this.ragSourcesBus = ragSourcesBus;
+ this.chatModeRouter = chatModeRouter;
+ this.kbQaService = kbQaService;
+ this.traceService = traceService;
+ this.streamGuard = streamGuard;
  this.self = self;
  }
 
@@ -158,6 +198,18 @@ public class ChatService {
  * @return SSE 发射器；调用方（Controller）直接返回它即可
  */
  public SseEmitter stream(Long userId, ChatRequest body) {
+ // ★★★ 会话级互斥（同一会话同时只允许一条流在生成）★★★
+ // 为什么必须加：本方法原本对同一 conversationId 没有任何互斥。而"用户双击发送"或
+ // "前端请求超时后自动重试"都会让同一会话同时跑两条流，后果有三个（都真实存在）：
+ // ① 两条回答交替写入 messages → 界面出现"两个气泡你一句我一句"；
+ // ② RagSourcesBus 的收集器按会话 id 索引 → 后一条流覆盖前一条，来源标注串台；
+ // ③ "重新生成"分支会删掉 id 更大的助手消息 → 可能把正在生成的那条删掉。
+ // 做法：进入时用 putIfAbsent 占住名额，被占用则以 409 直接拒绝（前端会提示"请稍候"）。
+ Long lockId = body.sessionId();
+ streamGuard.acquire(lockId);
+ // 本轮计时的起点：首字延迟与总耗时都相对它计算
+ long startedAt = System.currentTimeMillis();
+ try {
  // ---- 阶段一：同步准备（出错 = 普通 JSON 错误，连接尚未建立）----
  // ⚠️ 必须经 self（自己的代理）调用，不能写成 prepare(...)：
  // 后者是"同类自调用"，不经过代理 → prepare 上的 @Transactional 会静默失效（见 self 字段的注释）。
@@ -165,8 +217,12 @@ public class ChatService {
  Conversation conv = p.conv();
  Long convId = conv.getId();
  Long assistantId = p.assistantId();
- String provider = conv.getProvider();
- String model = conv.getModel();
+ // provider / model 不再在这里取：它取决于本轮走哪条链路（见下方 chooseTarget），
+ // 因为确定性知识问答用的是解析出的模型，可能与会话记录里写的不同。
+
+ // 记录准备阶段耗时。assistantId 同时就是这一轮的"锚点"（execution id）。
+ traceService.record(convId, assistantId, ChatTraceService.STAGE_PREPARE,
+ System.currentTimeMillis() - startedAt, null);
 
  // 为本轮请求建立"知识库来源收集器"（工具执行时往里追加命中文件名，
  // 见 RagSourcesBus 注释：解决 Agent 缓存复用与每请求收集器的冲突）
@@ -185,15 +241,24 @@ public class ChatService {
  }
  }
 
- // 取/建 Agent。若模型未配置，这里会抛 400（仍是普通 JSON 错误，未进入 SSE）
- ReactAgent agent = agentFactory.forConversation(
- convId, userId, enableThinking, thinkingBudget);
-
- // 请求消息 + 记忆隔离：thread_id = 会话 id 的字符串形式
- UserMessage userMessage = new UserMessage(p.sendText());
- RunnableConfig config = RunnableConfig.builder()
- .threadId(String.valueOf(convId))
- .build();
+ // ---- 路由：决定这一轮由谁执行 ----
+ // 判据见 ChatModeRouter：只有"启用了知识库 + 明确在问资料内容"才走确定性链路；
+ // 工具型、创作型、闲聊型一律交回 Agent —— 判错的代价不对称，宁可漏判。
+ List<Long> kbIds = conv.getActiveKbIds() == null ? List.of() : conv.getActiveKbIds();
+ ExecTarget target;
+ try {
+ target = chooseTarget(conv, convId, userId, p.sendText(), kbIds,
+ enableThinking, thinkingBudget, assistantId, startedAt);
+ } catch (GraphRunnerException e) {
+ throw ApiException.badRequest("模型初始化失败：" + e.getMessage());
+ }
+ Flux<org.springframework.ai.chat.messages.Message> messageStream = target.stream();
+ // provider/model 参与落库与 done 事件，必须只赋值一次（lambda 要求"有效 final"）。
+ // KB_QA 链路用的是解析出的模型，可能与会话记录里写的略有不同（走的是同一套兜底链）。
+ String provider = target.provider();
+ String model = target.model();
+ // 提示词字符数：确定性链路知道自己的证据长度，Agent 链路拿不到，用于 DONE 里的 token 估算
+ int promptChars = target.promptChars();
 
  // ---- 阶段二：建立 SSE，异步推流 ----
  SseEmitter emitter = new SseEmitter(SSE_TIMEOUT_MS);
@@ -207,24 +272,110 @@ public class ChatService {
  emitter.onTimeout(() -> onAbort(disp[0], assistantId, convId, answer, provider, model));
  emitter.onError(e -> onAbort(disp[0], assistantId, convId, answer, provider, model));
 
- // ★ 阶段一 / 阶段二 分界线：streamMessages 声明了受检异常 GraphRunnerException
- // （SAA 图运行时的异常）。此时还没往 SSE 推过任何事件，HTTP 连接也未以流形式
- // 建立，因此按"阶段一"处理——转为 ApiException.badRequest，由 GlobalExceptionHandler
- // 转成 {"detail":...} 的普通 JSON 错误（前端走 !resp.ok 分支读 detail）。
- // 一旦成功拿到 Flux 并订阅成功，才真正进入异步推流（阶段二），之后的错误只能
- // 用 {"error":...} 事件回传（见 onError）。
- try {
- disp[0] = agent.streamMessages(userMessage, config)
- .subscribe(
- msg -> onNext(msg, emitter, splitter, answer, seen, convId, sourcesEmitted),
+ // 订阅消息流。
+ // 注意：模型初始化（可能抛受检异常 GraphRunnerException）已经在上面处理完 ——
+ // 走到这里说明"已经拿到可用的流"，因此之后的错误一律用 {"error":...} 事件回传
+ // （连接已是 200/SSE，无法再改状态码）。
+ disp[0] = messageStream.subscribe(
+ msg -> onNext(msg, emitter, splitter, answer, seen, convId, sourcesEmitted,
+ assistantId, startedAt),
  err -> onError(err, emitter, assistantId, convId, answer, provider, model),
  () -> onComplete(emitter, assistantId, convId, answer,
- provider, model, p.userMessageId(), sourcesEmitted, splitter));
- } catch (GraphRunnerException e) {
- throw ApiException.badRequest("模型初始化失败：" + e.getMessage());
- }
+ provider, model, p.userMessageId(), sourcesEmitted, splitter,
+ startedAt, promptChars));
 
  return emitter;
+ } catch (RuntimeException e) {
+ // 同步阶段（还没开始推流）就失败时，也必须释放占位 ——
+ // 否则这个会话会被一次失败的请求永久锁住，之后再也发不出消息。
+ // 流已成功启动后，占位由三条收尾路径负责释放（onComplete / onError / onAbort）。
+ streamGuard.release(lockId);
+ throw e;
+ }
+ }
+
+ // ==================================================================
+ // 执行链路选择（确定性知识问答 / 开放式 Agent）
+ // ==================================================================
+
+ /**
+ * 决定这一轮由谁执行，并给出消息流与实际使用的 provider/model。
+ *
+ * <h2>两条链路的取舍</h2>
+ * <ul>
+ * <li><b>确定性知识问答</b>：先检索、再把带编号的证据交给模型生成。
+ * 好处是"必须检索"由代码保证，不再取决于模型这一轮愿不愿意调工具。</li>
+ * <li><b>开放式 Agent</b>：带工具的 ReAct 循环，能写写画画、加待办、查天气。</li>
+ * </ul>
+ *
+ * <h2>⚠️ 已知限制（务必知悉）</h2>
+ *
+ * <p>确定性链路<b>不经过 Agent，因此不会写入 Agent 的对话记忆</b>。
+ * 界面上的聊天记录照常落库、下一轮的查询改写也能读到；但"知识问答之后紧接一轮
+ * 需要回忆该内容的 Agent 对话"时，Agent 看不到上一轮的内容。
+ * 要补齐需要把该轮问答写进记忆检查点，而手工构造检查点状态风险较高（见记忆回写相关说明），
+ * 故暂不做；同模式的连续提问不受影响。
+ *
+ * @throws GraphRunnerException Agent 初始化失败（由调用方转成 400 普通 JSON 错误）
+ */
+ private ExecTarget chooseTarget(Conversation conv, Long convId, Long userId, String sendText,
+ List<Long> kbIds, Boolean enableThinking, Integer thinkingBudget,
+ Long exchangeId, long startedAt)
+ throws GraphRunnerException {
+ // ---- 路由（耗时极低，但记录下来才能证明"这一轮走的是哪条链路"）----
+ long routeStart = System.currentTimeMillis();
+ boolean kbQa = chatModeRouter.route(sendText, kbIds) == ChatModeRouter.Mode.KB_QA;
+ traceService.record(convId, exchangeId, ChatTraceService.STAGE_ROUTE,
+ System.currentTimeMillis() - routeStart, "mode=" + (kbQa ? "KB_QA" : "OPEN_AGENT"));
+
+ if (kbQa) {
+ long retrieveStart = System.currentTimeMillis();
+ // 与 Agent 链路共用同一套凭据解析（见 AgentFactory.resolveModel）——
+ // 若各写一份，两边一旦走岔就会出现"Agent 能连上模型、知识问答却报未配置"的怪问题。
+ // 知识问答不需要"深度思考"（只会徒增首字延迟），显式关掉。
+ AgentFactory.ResolvedModel rm = agentFactory.resolveModel(conv, userId, false, null);
+ Optional<KbQaService.Prepared> prepared =
+ kbQaService.prepare(userId, convId, sendText, kbIds, rm);
+ traceService.record(convId, exchangeId, ChatTraceService.STAGE_RETRIEVE,
+ System.currentTimeMillis() - retrieveStart,
+ prepared.map(p -> "命中" + p.hitCount() + "段；查询=" + p.usedQuery())
+ .orElse("未命中证据，回退 Agent"));
+ if (prepared.isPresent()) {
+ return new ExecTarget(prepared.get().flux(), rm.provider(), rm.model(),
+ prepared.get().evidenceChars());
+ }
+ // 资料里没检索到证据（或链路出错）→ 回退 Agent：
+ // 用户问的可能本来就不在资料范围内，回一句生硬的"未检索到证据"体验很差。
+ log.info("知识问答未命中证据，回退 Agent 路径（会话 {}）", convId);
+ }
+
+ // 开放式 Agent：取/建带工具与记忆的 ReAct 智能体。
+ // 记忆隔离靠 thread_id = 会话 id 的字符串形式。
+ long buildStart = System.currentTimeMillis();
+ ReactAgent agent = agentFactory.forConversation(convId, userId, enableThinking, thinkingBudget);
+ UserMessage userMessage = new UserMessage(sendText);
+ RunnableConfig config = RunnableConfig.builder()
+ .threadId(String.valueOf(convId))
+ .build();
+ Flux<org.springframework.ai.chat.messages.Message> stream = agent.streamMessages(userMessage, config);
+ traceService.record(convId, exchangeId, ChatTraceService.STAGE_AGENT_BUILD,
+ System.currentTimeMillis() - buildStart,
+ "provider=" + conv.getProvider() + " model=" + conv.getModel());
+
+ // Agent 链路拿不到提示词长度，promptChars 记 0（DONE 里只统计回答侧 token 估算）
+ return new ExecTarget(stream, conv.getProvider(), conv.getModel(), 0);
+ }
+
+ /**
+ * 本轮的执行目标。
+ *
+ * @param stream      可直接订阅的消息流
+ * @param provider    实际使用的 provider（落库与 done 事件要用）
+ * @param model       实际使用的模型名
+ * @param promptChars 提示词/证据的字符数（用于 token 估算；未知时为 0）
+ */
+ private record ExecTarget(Flux<org.springframework.ai.chat.messages.Message> stream,
+ String provider, String model, int promptChars) {
  }
 
  // ==================================================================
@@ -307,7 +458,9 @@ public class ChatService {
  StringBuilder answer,
  String[] seen,
  Long convId,
- AtomicBoolean sourcesEmitted) {
+ AtomicBoolean sourcesEmitted,
+ Long exchangeId,
+ long startedAt) {
  // 只处理 AI（助手）消息；工具消息等内部流转的不向外暴露
  // ⚠️ Spring AI 的 MessageType 枚举值是 ASSISTANT（不是 AI；没有 AI 这个常量）
  if (!MessageType.ASSISTANT.equals(msg.getMessageType())) {
@@ -345,6 +498,12 @@ public class ChatService {
  .data(ChatStreamEvent.reasoning(parts[0]).toData()));
  }
  if (!parts[1].isEmpty()) {
+ // 首字延迟：第一次真正吐出正文时记一笔（从请求开始算）。
+ // 这是体验上最有价值的指标 —— 比总耗时更能反映"用户等了多久才看到东西"。
+ if (answer.length() == 0) {
+ traceService.record(convId, exchangeId, ChatTraceService.STAGE_FIRST_TOKEN,
+ System.currentTimeMillis() - startedAt, null);
+ }
  answer.append(parts[1]);
  emitter.send(SseEmitter.event()
  .data(ChatStreamEvent.token(parts[1]).toData()));
@@ -378,7 +537,8 @@ public class ChatService {
  private void onComplete(SseEmitter emitter, Long assistantId, Long convId,
  StringBuilder answer, String provider, String model,
  Long userMessageId, AtomicBoolean sourcesEmitted,
- ThinkSplitter splitter) {
+ ThinkSplitter splitter,
+ long startedAt, int promptChars) {
  // ★★★ 收尾必须 flush 拆分器（对应 流式聊天 的 `splitter.flush()`，本实现一度漏掉）★★★
  // ThinkSplitter.feed() 每帧都会"故意保留末尾若干字符"（怕 thinking 标签跨帧被拆断），
  // 所以流结束时缓冲里一定还剩东西。不 flush 会有两个后果：
@@ -401,6 +561,11 @@ public class ChatService {
 
  persistAssistant(assistantId, answer.toString(), provider, model); // 自身已吞异常
 
+ // 收尾记录：总耗时 + token 估算（prompt 侧未知时记 0，只统计回答侧）。
+ // 只在这条"正常结束"的路径记录 —— 超时/出错/断连那两条路径没有可靠的结束时刻。
+ traceService.recordDone(convId, assistantId, System.currentTimeMillis() - startedAt,
+ provider, model, promptChars, answer.length());
+
  // 2) ★★★ 无论前面发生什么，都必须把流"关掉" ★★★
  // 【真实 bug】原实现把 emitter.complete() 放在只 catch(IOException) 的 try 里，
  // 前面任一步抛"非受检异常"（emitter.send 在客户端已断开/已关闭时会抛
@@ -422,6 +587,8 @@ public class ChatService {
  completeQuietly(emitter); // ★ 无条件关闭连接（止血点）
  // 流结束（无论成功与否）都清理本轮来源收集器，避免陈旧数据滞留与内存泄漏
  ragSourcesBus.unregister(convId);
+ // 同时释放会话占位，让用户能接着发下一条（漏了这句，停止后本会话就被锁死了）
+ streamGuard.release(convId);
  }
  }
 
@@ -443,6 +610,7 @@ public class ChatService {
  } finally {
  completeQuietly(emitter); // ★ 错误路径同样必须无条件关闭，否则停止按钮一样会卡住
  ragSourcesBus.unregister(convId);
+ streamGuard.release(convId); // 出错也必须释放占位，否则该会话再也发不出消息
  }
  }
 
@@ -459,6 +627,7 @@ public class ChatService {
  log.warn("清记忆失败（不影响收尾）: {}", e.getMessage());
  }
  ragSourcesBus.unregister(convId);
+ streamGuard.release(convId); // 断连/超时同样释放占位
  }
 
  /**
@@ -488,6 +657,27 @@ public class ChatService {
  emitter.complete();
  } catch (Exception e) {
  log.debug("关闭 SSE 失败（可能已关闭）：{}", e.getMessage());
+ }
+ }
+
+ // ==================================================================
+ // 会话级互斥的兜底清扫
+ // ==================================================================
+
+ /**
+ * 定时清扫超时占位（兜底）。
+ *
+ * <p>占位的正常释放靠三条收尾路径；但回调在极端情况下可能一个都不触发
+ * （容器异常、连接被中间设备静默断开）。闸门自身的"超时接管"能兜住这种情况，
+ * 但那要等到下一条请求进来才生效；定时清扫让状态维持在干净状态，也避免条目长期堆积。
+ *
+ * <p>每 60 秒扫一次足够（阈值是分钟级）。互斥语义本身见 {@link ConversationStreamGuard}。
+ */
+ @Scheduled(fixedDelay = 60_000L)
+ public void sweepStaleStreams() {
+ int removed = streamGuard.sweep();
+ if (removed > 0) {
+ log.warn("清扫超时的会话生成占位 {} 个（对应流的收尾回调未触发）", removed);
  }
  }
 

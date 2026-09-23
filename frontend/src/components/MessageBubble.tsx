@@ -11,11 +11,15 @@
  * content —— 消息正文（Markdown 源文本）
  * streaming —— 是否正在流式输出中，透传给 Markdown 以显示打字光标
  * onDelete —— 可选；传入才渲染删除按钮（删除该条，连同同一轮问答）
+ * aboveBubble —— 可选；渲染在气泡【上方】的内容（当前用于「执行过程」入口）。
+ *   传了它才会多包一层 .msg-body 列容器：这样按钮能紧贴头像（同一行），
+ *   展开时把气泡整体往下推。不传时 DOM 与改动前完全一致 —— 用户消息不受影响。
  *
  * 组件事件：
  * onDelete 由 ChatWindow 提供，本组件只负责在点击时调用。
  */
 import { Trash2 } from 'lucide-react'
+import type { ReactNode } from 'react'
 import Markdown from './Markdown'
 
 export default function MessageBubble({
@@ -23,19 +27,31 @@ export default function MessageBubble({
  content,
  streaming,
  onDelete,
+ aboveBubble,
 }: {
  role: string
  content: string
  streaming?: boolean
  onDelete?: () => void
+ aboveBubble?: ReactNode
 }) {
  const isUser = role === 'user'
- return (
- <div className={`bubble-row ${isUser ? 'right' : 'left'}`}>
- <div className="avatar">{isUser ? '我' : 'AI'}</div>
+ const bubble = (
  <div className={`bubble ${isUser ? 'bubble-user' : 'bubble-assistant'}`}>
  <Markdown content={content} streaming={streaming} />
  </div>
+ )
+ return (
+ <div className={`bubble-row ${isUser ? 'right' : 'left'}`}>
+ <div className="avatar">{isUser ? '我' : 'AI'}</div>
+ {aboveBubble ? (
+ <div className="msg-body">
+ {aboveBubble}
+ {bubble}
+ </div>
+ ) : (
+ bubble
+ )}
  {onDelete && (
  <button className="msg-del" title="删除这条消息（连同同一轮问答）" onClick={onDelete}>
  <Trash2 size={13} />

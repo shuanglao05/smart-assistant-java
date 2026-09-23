@@ -69,9 +69,26 @@ public class KbChunk {
  @Column(name = "chunk_text", nullable = false, columnDefinition = "MEDIUMTEXT")
  private String text;
 
- /** 向量，形如 {@code [0.0123, -0.456, ...]} 的 JSON 文本。 */
- @Column(name = "embedding", nullable = false, columnDefinition = "MEDIUMTEXT")
+ /**
+ * 旧版向量列：JSON 文本。
+ *
+ * <p><b>已改为二进制存储</b>（见 {@link #embeddingBin}），此列只为兼容历史数据而保留：
+ * 读取时优先用二进制列，它为空才回退解析本列。一次性回填跑完并确认无误后，本列即可删除。
+ *
+ * <p>因此数据库里这一列已放宽为可空（新写入不再填它），实体这里同步去掉 not-null 约束。
+ */
+ @Column(name = "embedding", columnDefinition = "MEDIUMTEXT")
  private String embedding;
+
+ /**
+ * 向量本体：float32 小端字节序列（1024 维 = 4096 字节）。
+ *
+ * <p>相比 JSON 文本：体积小约 4.5 倍，更重要的是<b>读取时不必做文本解析</b> ——
+ * 检索要把该用户的全部片段向量读进内存，几千行就是几千次 JSON 解析，
+ * 那才是检索慢的主因（余弦计算本身只有毫秒级）。编解码见 {@code Vectors}。
+ */
+ @Column(name = "embedding_bin", columnDefinition = "MEDIUMBLOB")
+ private byte[] embeddingBin;
 
  @Column(name = "created_at")
  private LocalDateTime createdAt;

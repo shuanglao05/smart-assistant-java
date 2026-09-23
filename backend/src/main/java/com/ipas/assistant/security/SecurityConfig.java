@@ -50,7 +50,14 @@ public class SecurityConfig {
  // Spring Boot 的错误转发端点：若不放开，任何异常都会被改写成 401，
  // 会让「参数错误」这类问题变得极难排查
  "/error",
- };
+ // 接口文档（Swagger UI / OpenAPI）。是否真的对外可用由 springdoc.*.enabled 决定：
+ // 关掉后这些路径会直接 404，放行它们是"路径白名单"的一部分，不代表一定会暴露。
+ // 对外部署时请把 SWAGGER_ENABLED 设为 false（见 application.yml）。
+ "/swagger-ui.html",
+ "/swagger-ui/**",
+ "/v3/api-docs",
+ "/v3/api-docs/**",
+};
 
  private final JwtAuthenticationFilter jwtAuthenticationFilter;
  private final RestAuthenticationEntryPoint authenticationEntryPoint;

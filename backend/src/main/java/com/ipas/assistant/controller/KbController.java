@@ -103,7 +103,11 @@ public class KbController {
  @GetMapping("/graph")
  public ResponseEntity<KbDtos.KbGraph> graph(
  @AuthenticationPrincipal AuthUser me,
- @RequestParam Long collectionId) {
+ // ⚠️ 必须显式写 value：裸 @RequestParam 会取"编译后的参数名"（这里是 collectionId），
+ // 而前端（与 Python 原版）用的是 snake_case 的 collection_id ——
+ // 两边对不上时后端返回 422，而前端的 .catch 会把错误静默吞掉，
+ // 表现为"关系图页面一片空白"，极难定位。名字以契约（前端）为准。
+ @RequestParam(value = "collection_id") Long collectionId) {
  return ResponseEntity.ok(kbService.graph(me.id(), collectionId));
  }
 

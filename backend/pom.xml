@@ -152,6 +152,43 @@
  <artifactId>lombok</artifactId>
  <optional>true</optional>
  </dependency>
+ <!--
+ 接口文档（OpenAPI / Swagger UI）。
+ 作用：几十个接口不必再靠读代码理解，打开 /swagger-ui.html 就能看到并按分组调试；
+ 同时它也是"接口契约"的可视化形式，答辩/交接时比文字描述可靠得多。
+ ⚠️ 默认开启便于开发与演示，但它会把接口清单暴露出去 —— 对外部署时用
+ SWAGGER_ENABLED=false 关掉（见 application.yml 的 springdoc 段）。
+ ⚠️ 版本要与 Spring Boot 对齐：2.8.x 系列面向 Boot 3.4/3.5，升级 Boot 时需复核。
+ -->
+ <dependency>
+ <groupId>org.springdoc</groupId>
+ <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+ <version>2.8.6</version>
+ </dependency>
+
+ <!--
+ MinIO（对象存储）客户端。
+ 只在 app.storage.backend=minio 时才会被实例化（见 MinioFileStorage 的 @ConditionalOnProperty），
+ 默认的 local 后端完全用不到它 —— 保留依赖是为了让"切换后端"真的只需改一个配置值。
+ 代价是 jar 里多几个类（okhttp / kotlin-stdlib），若将来要瘦身可拆成独立 Maven profile。
+ -->
+ <dependency>
+ <groupId>io.minio</groupId>
+ <artifactId>minio</artifactId>
+ <version>8.5.17</version>
+ </dependency>
+
+ <!--
+ PostgreSQL JDBC 驱动。
+ 只在 app.rag.vector-store=pgvector 时才会被用到（见 PgVectorIndex 的 @ConditionalOnProperty），
+ 默认的 mysql 检索路径完全用不到它 —— 保留依赖同样是为了"切换后端只改一个配置值"。
+ -->
+ <dependency>
+ <groupId>org.postgresql</groupId>
+ <artifactId>postgresql</artifactId>
+ <version>42.7.4</version>
+ </dependency>
+
  <dependency>
  <groupId>org.springframework.boot</groupId>
  <artifactId>spring-boot-starter-test</artifactId>

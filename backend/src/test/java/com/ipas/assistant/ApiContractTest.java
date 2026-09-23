@@ -10,6 +10,7 @@ import com.ipas.assistant.entity.Skill;
 import com.ipas.assistant.entity.TodoItem;
 import com.ipas.assistant.entity.User;
 import com.ipas.assistant.repository.AppSettingRepository;
+import com.ipas.assistant.repository.ChatTraceRepository;
 import com.ipas.assistant.repository.ConversationRepository;
 import com.ipas.assistant.repository.CourseRepository;
 import com.ipas.assistant.repository.FileItemRepository;
@@ -143,6 +144,8 @@ class ApiContractTest {
  private KbChunkRepository kbChunkRepository;
  @MockitoBean
  private KbCollectionRepository kbCollectionRepository;
+ @MockitoBean
+ private ChatTraceRepository chatTraceRepository;
 
  /**
  * Ollama 连通性服务的替身。
@@ -1176,6 +1179,32 @@ class ApiContractTest {
  .header("Authorization", "Bearer " + token()))
  .andExpect(status().isUnprocessableEntity())
  .andExpect(jsonPath("$.detail").isNotEmpty());
+ }
+
+ /**
+ * 守住 <b>参数名</b>：前端（与 Python 原版）用的是 snake_case 的 {@code collection_id}。
+ *
+ * <p>这条断言是被一个真实 bug 逼出来的：该接口原本写成裸 {@code @RequestParam Long collectionId}，
+ * 于是实际要求的参数名是可编译后的驼峰名 —— 前端发 {@code collection_id} 收到 422，
+ * 而前端的 {@code .catch} 把错误静默吞掉，表现成"关系图页面一片空白"。
+ *
+ * <p><b>为什么上面的"缺参数→422"测试没能拦住它</b>：不断言参数名时，
+ * "驼峰"和"下划线"两个版本都会让"缺参数"这条用例通过 —— 只有用<b>契约里的名字</b>
+ * 发一次请求，才能证明两边对得上。
+ */
+ @Test
+ @DisplayName("GET /api/kb/graph —— 用契约里的 collection_id 能被识别（不是 422）")
+ void graphAcceptsSnakeCaseParamName() throws Exception {
+ mockMvc.perform(get("/api/kb/graph").param("collection_id", "1")
+ .header("Authorization", "Bearer " + token()))
+ .andExpect(result -> {
+ int status = result.getResponse().getStatus();
+ if (status == 422) {
+ // 主动抛错而不是用断言工具：本类没有引入 JUnit 的 Assertions 静态导入，
+ // 而这里的判定本身很简单（"不能是 422"），抛异常最直白。
+ throw new AssertionError("参数名必须是 collection_id；返回 422 说明又被写成驼峰 collectionId 了");
+ }
+ });
  }
 
  @Test

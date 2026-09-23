@@ -1,11 +1,14 @@
 package com.ipas.assistant.service;
 
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.ipas.assistant.config.AppProperties;
 import com.ipas.assistant.entity.AppSetting;
 import com.ipas.assistant.repository.AppSettingRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -94,19 +97,47 @@ public class RuntimeSettingsService {
  private final AppSettingRepository repository;
  private final AppProperties defaults;
 
+ /**
+ * 配置快照的缓存（Caffeine）。
+ *
+ * <p><b>为什么值得缓存</b>：{@link #load} 在"每次对话构建 Agent"时都会被调用，
+ * 而它每次都查一次库；同一轮请求里还可能被多处调用，属于纯重复劳动。
+ *
+ * <p><b>为什么不会导致"改完不生效"</b>：所有写入路径（{@link #save} / {@link #put}）
+ * 都会显式让缓存失效，所以"设置页保存 → 立即生效"这个语义完全不变。
+ * TTL 只是兜底：万一有人直接改库（绕过接口），最多 30 秒后也会自动看到新值。
+ *
+ * <p>键是 userId —— 配置本身就是按用户隔离的。
+ * 用 {@code maximumSize} 而不是无界：多用户长期运行也不会把内存撑大。
+ */
+ private final Cache<Long, LlmSettings> settingsCache = Caffeine.newBuilder()
+ .maximumSize(256)
+ .expireAfterWrite(Duration.ofSeconds(30))
+ .build();
+
  public RuntimeSettingsService(AppSettingRepository repository, AppProperties defaults) {
  this.repository = repository;
  this.defaults = defaults;
  }
 
  /**
- * 当前生效的「大模型相关配置」快照。
+ * 当前生效的「大模型相关配置」快照（带缓存）。
  *
- * <p>一次查库拿下全部配置项，然后在内存里逐项与默认值合并 ——
- * 比"每项一次查询"少 8 次数据库往返，而这个快照在每次对话构建 Agent 时都会用到。
+ * <p>先看缓存，未命中才查库 —— 一次查库拿下全部配置项，再在内存里逐项与默认值合并。
  */
  @Transactional(readOnly = true)
  public LlmSettings load(Long userId) {
+ LlmSettings cached = settingsCache.getIfPresent(userId);
+ if (cached != null) {
+ return cached;
+ }
+ LlmSettings fresh = loadFromDb(userId);
+ settingsCache.put(userId, fresh);
+ return fresh;
+ }
+
+ /** 真正查库并合并默认值的那一步（缓存未命中时才会走到）。 */
+ private LlmSettings loadFromDb(Long userId) {
  Map<String, String> stored = new HashMap<>();
  for (AppSetting s : repository.findByUserIdAndSettingKeyIn(userId, ALL_KEYS)) {
  stored.put(s.getSettingKey(), s.getSettingValue());
@@ -138,6 +169,9 @@ public class RuntimeSettingsService {
  */
  @Transactional
  public void save(Long userId, Map<String, String> values) {
+ // 先失效再写：万一写到一半抛异常，也只是白失效一次（下次读会重新查库），
+ // 绝不会留下"库里改了、缓存还是旧值"的脏读。
+ settingsCache.invalidate(userId);
  for (Map.Entry<String, String> e : values.entrySet()) {
  String key = e.getKey();
  String value = e.getValue();

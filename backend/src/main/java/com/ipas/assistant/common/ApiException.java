@@ -49,6 +49,17 @@ public class ApiException extends RuntimeException {
  return new ApiException(HttpStatus.NOT_FOUND, message);
  }
 
+ /**
+ * 便捷构造：409 Conflict —— 请求与资源当前状态冲突。
+ *
+ * <p>典型场景：同一个会话已经有一条回答正在生成，又来了第二条流式请求。
+ * 这既不是参数错误（400）也不是资源不存在（404），而是"当前状态不允许"，
+ * 用 409 最准确；前端对 4xx 的处理逻辑一致（读 {@code detail} 提示用户）。
+ */
+ public static ApiException conflict(String message) {
+ return new ApiException(HttpStatus.CONFLICT, message);
+ }
+
  public HttpStatus getStatus() {
  return status;
  }

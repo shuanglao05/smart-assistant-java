@@ -58,8 +58,17 @@ public class ChatModelFactory {
 
  private final AppProperties properties;
 
- public ChatModelFactory(AppProperties properties) {
+ /**
+ * 韧性保护（限流 / 熔断 / 退避重试）。
+ *
+ * <p>装饰在本工厂的出口上，等价于给<b>所有</b>模型调用统一加保护 ——
+ * 工厂是全项目唯一构造模型的地方，调用方（Agent / 知识问答 / 查询改写 / 课表导入）一行都不用改。
+ */
+ private final LlmResilience resilience;
+
+ public ChatModelFactory(AppProperties properties, LlmResilience resilience) {
  this.properties = properties;
+ this.resilience = resilience;
  }
 
  /**
@@ -84,10 +93,13 @@ public class ChatModelFactory {
  RuntimeSettingsService.LlmSettings settings) {
 
  String p = provider == null ? "" : provider.trim().toLowerCase();
- if ("ollama".equals(p)) {
- return createOllama(model, settings);
- }
- return createCloud(model, apiKey, baseUrl, enableThinking, thinkingBudget);
+ ChatModel raw = "ollama".equals(p)
+ ? createOllama(model, settings)
+ : createCloud(model, apiKey, baseUrl, enableThinking, thinkingBudget);
+ // 统一套上韧性保护：工厂是全项目唯一构造模型的地方，
+ // 在这里装饰一次，所有入口（Agent / 知识问答 / 查询改写 / 课表导入）就都带上了。
+ // label 取 "provider:model"，出问题时日志里能直接看出是哪个模型在抖动。
+ return new ResilientChatModel(raw, resilience, p + ":" + model);
  }
 
  // ==================================================================

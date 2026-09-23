@@ -24,6 +24,23 @@ spring:
   application:
     name: smart-assistant-java
 
+  # ---------------------------------------------------------------- 虚拟线程
+  # 打开 Java 21 的虚拟线程：Tomcat 的请求处理改用虚拟线程。
+  #
+  # 【为什么这里收益明显】本项目几乎全是"等待型"IO —— 等大模型吐 token、等数据库、
+  # 等嵌入服务。平台线程在阻塞等待时仍占着约 1MB 栈内存；虚拟线程在等待时会释放载体线程，
+  # 因此同样的内存能支撑高得多的并发（尤其流式对话这种"一个请求挂几秒到几分钟"的场景）。
+  #
+  # ⚠️【唯一的陷阱】synchronized 包住阻塞调用会"钉住"载体线程，让虚拟线程退化成平台线程。
+  # 本项目已核查：全后端仅一处 synchronized（CloudHttpGateway 的 HttpClient 双检锁），
+  # 它只包了一段对象构造、不含任何网络 IO，因此无此风险。
+  # 今后若新增"synchronized 包 IO"的代码，应改用 ReentrantLock。
+  #
+  # 可用环境变量 VIRTUAL_THREADS=false 关掉（万一遇到个别类库不兼容可快速回退）。
+  threads:
+    virtual:
+      enabled: ${VIRTUAL_THREADS:true}
+
   # ---------------------------------------------------------------- 本地私有配置
   # 把「不该进版本库」的东西（数据库密码、各类 API Key）单独放 application-local.yml，
   # 它已在 .gitignore 里排除。
@@ -152,6 +169,24 @@ app:
     # 视觉模型：用于课表截图识别等多模态任务
     vision-model: ${VISION_MODEL:qwen3-vl-plus}
 
+    # ---- 模型调用的韧性保护（限流 / 熔断 / 退避重试）----
+    # 这些值直接决定"云端抖动时用户是几乎无感，还是看到一个失败弹窗"。
+    resilience:
+      # 最多尝试几次（含首次）。1 = 不重试。只对"瞬时故障"（429 / 5xx / 超时）重试，
+      # 参数错误与鉴权失败会立刻返回，不做无谓重试。
+      max-attempts: ${LLM_MAX_ATTEMPTS:3}
+      # 退避基数（毫秒）：第 1 次失败等它，第 2 次等 2 倍…… 避免服务刚抖动时继续加压。
+      backoff-ms: ${LLM_BACKOFF_MS:500}
+      # 连续多少次瞬时失败后打开熔断。打开后所有调用直接快速失败，不再去等超时（防雪崩）。
+      circuit-threshold: ${LLM_CIRCUIT_THRESHOLD:5}
+      # 熔断打开后冷却多久（毫秒）才允许再试。
+      circuit-open-ms: ${LLM_CIRCUIT_OPEN_MS:30000}
+      # 同时进行的模型调用上限。本地 Ollama 尤其怕并发：同时来一堆请求会一起变慢、最后一起超时；
+      # 限流后表现为"排队稍慢"，而不是"集体失败"。
+      max-concurrent: ${LLM_MAX_CONCURRENT:4}
+      # 等待并发许可的最长时间（毫秒）：等不到就快速失败，比让用户干等更好。
+      acquire-timeout-ms: ${LLM_ACQUIRE_TIMEOUT_MS:10000}
+
   # ---- Embedding / RAG ----
   rag:
     embed-base-url: ${EMBED_BASE_URL:http://localhost:11434/v1}
@@ -166,6 +201,49 @@ app:
     embed-batch: ${RAG_EMBED_BATCH:32}
     # 单次检索返回片段总上限：多知识库各自取 Top-K 后合并，防止撑爆上下文
     max-total-chunks: ${RAG_MAX_TOTAL_CHUNKS:30}
+    # 最低相似度闸门：余弦相似度低于此值的片段直接丢弃。
+    # 作用：用户问语料里根本没有的问题时，避免把一堆低分片段喂给模型导致幻觉；
+    # 过滤后无片段会走"未检索到足够证据"的短路。
+    # ⚠️ 0.35 是按 bge-m3 的常见分数分布给的起点，务必按自己的数据实测标定；
+    # 若正常提问开始频繁答"未检索到足够证据"，说明偏高，调低即可（无需改代码）。
+    # 设为 0 或负数 = 关闭闸门。
+    min-similarity: ${RAG_MIN_SIMILARITY:0.35}
+    # 证据字符预算：拼进提示词的证据总字数上限（比"条数上限"更贴近真实的上下文占用）。
+    # 按相似度降序累加，超出即停止收录。0 或负数 = 不限制。
+    evidence-max-chars: ${RAG_EVIDENCE_MAX_CHARS:6000}
+    # 是否启用混合检索（向量通道 + 关键词通道 → RRF 融合）。
+    # 关键词通道走 MySQL 全文索引（ngram 解析器，中文友好），补上向量检索对
+    # "精确字面"（编号、配置项名、专有名词）召回不足的短板。
+    # 全文索引缺失或查询异常时会自动降级为"只用向量通道"，不会让检索失败。
+    hybrid-enabled: ${RAG_HYBRID_ENABLED:true}
+    # 关键词通道的相对分数门槛：命中分数低于"本批最高分 × 该比例"的会被丢弃。
+    # 用相对值是因为全文检索分值没有固定量纲（随语料变化）；0 或负数 = 不设门槛。
+    keyword-relative-score-floor: ${RAG_KEYWORD_FLOOR:0.35}
+    # 上下文扩窗：命中片段时，把同文件序号 ±N 的相邻片段一并作为证据（0 = 不扩窗）。
+    # 命中的往往只是"一小段"，带上邻居能明显提升回答完整度；证据总量仍受上面的字符预算约束。
+    neighbor-window: ${RAG_NEIGHBOR_WINDOW:1}
+
+    # 一次性把历史片段的「JSON 向量」转成「二进制向量」（引入二进制存储时留的迁移器）。
+    # 转换是纯格式搬运：不调用模型、不需要 Ollama，几万条也就几秒。
+    # ⚠️ 环境变量只有在 yml 里这样声明过才会生效（见下面 vector-store 段也一样）——
+    #    Spring 不会把任意环境变量自动映射到自定义配置键上。
+    backfill-embeddings: ${RAG_BACKFILL_EMBEDDINGS:false}
+
+    # ---- 向量检索后端 ----
+    # mysql（默认）= 加载候选后在内存里算余弦，不依赖任何外部组件；
+    # pgvector     = 把"向量 + chunk_id"放到 PostgreSQL 里做近邻检索（正文仍在 MySQL）。
+    # 做成开关是硬要求：外部依赖出问题时能一条配置切回 MySQL，检索不至于整体失效。
+    vector-store: ${VECTOR_STORE:mysql}
+    pgvector:
+      url: ${PGVECTOR_URL:jdbc:postgresql://127.0.0.1:5432/ipas_vectors}
+      user: ${PGVECTOR_USER:ipas}
+      # ⚠️ 凭据：走环境变量或 application-local.yml，不要提交进版本库
+      password: ${PGVECTOR_PASSWORD:}
+      # 向量维度，必须与嵌入模型一致（bge-m3 = 1024）；不一致时写入会被 PG 直接拒绝
+      dimension: ${PGVECTOR_DIM:1024}
+      # 一次性回填：启动时把 MySQL 里已有的向量搬到 pgvector。跑一次就把它去掉。
+      # 搬的是"已经算好的向量"（不重新嵌入）：秒级完成，且不会因为模型版本变化导致向量漂移。
+      backfill: ${RAG_BACKFILL_VECTORS:false}
 
   # ---- 对话上下文管理（历史压缩相关配置）----
   history:
@@ -197,6 +275,28 @@ app:
       #    而 CREATE_IF_NOT_EXISTS 在构造时要连库执行 DDL，在无库环境会失败。
       create-option: ${AGENT_MEMORY_CREATE_OPTION:CREATE_IF_NOT_EXISTS}
 
+  # ---- 只读展示模式 ----
+  # 打开后：除「浏览类请求（GET/HEAD/OPTIONS）」与「登录注册」之外，
+  # 所有 /api 写操作都会被拒绝（403 + {"detail":"..."}）。
+  # 用途：把系统在线演示给别人看时，避免对方误改、误删你的数据。默认关闭。
+  preview-mode:
+    enabled: ${PREVIEW_MODE:false}
+
+  # ---- 文件存储后端 ----
+  # local（默认）= 落在本地磁盘的 data/uploads/ 下；
+  # minio = 存到 MinIO 对象存储（对象键与本地布局同一语义，见 MinioFileStorage）。
+  # 业务代码只依赖 FileStoragePort 端口，所以切换后端只需改这一个值，
+  # FileService / KbService 一行都不用动。实现选择靠 @ConditionalOnProperty。
+  storage:
+    backend: ${STORAGE_BACKEND:local}
+    # MinIO 专用配置（仅 backend=minio 时生效）。
+    # ⚠️ access-key / secret-key 是凭据：请用环境变量传入，不要写进这个文件、更不要提交版本库。
+    minio:
+      endpoint: ${MINIO_ENDPOINT:http://127.0.0.1:9000}
+      access-key: ${MINIO_ACCESS_KEY:}
+      secret-key: ${MINIO_SECRET_KEY:}
+      bucket: ${MINIO_BUCKET:ipas-uploads}
+
   # ---- 文件上传 ----
   upload:
     max-mb: ${MAX_UPLOAD_MB:50}
@@ -213,6 +313,35 @@ app:
     allowed-origins:
       - http://localhost:5174
       - http://127.0.0.1:5174
+
+  # ---- 对话执行链路 ----
+  chat:
+    # 是否启用「确定性知识问答」：明确在问资料内容的问题，先检索、再把带编号的证据
+    # 交给模型生成，不再依赖模型自己决定要不要检索（避免"这次调工具、下次不调"的不可复现）。
+    # 打开是安全的：检索不到证据时会自动回退到 Agent 路径。
+    kb-qa-enabled: ${CHAT_KB_QA_ENABLED:true}
+    # 是否启用检索查询改写：多轮里的省略句（"那它怎么配置"）先结合历史补全再检索。
+    # 只在问题看着像省略句时才真的调模型，所以对普通提问没有额外延迟。
+    rewrite-enabled: ${CHAT_REWRITE_ENABLED:true}
+
+# ============================================================================
+#  接口文档（OpenAPI / Swagger UI）
+#
+#  打开后可访问：
+#    · /swagger-ui.html   —— 可视化界面，按 Controller 分组，可直接发请求调试
+#    · /v3/api-docs       —— 机器可读的 OpenAPI 描述（可供前端生成客户端）
+#
+#  ⚠️ 它会暴露接口清单，属于信息暴露面。开发与答辩演示时开启，
+#     对外部署时用环境变量 SWAGGER_ENABLED=false 关掉（关掉后相关路径直接 404）。
+# ============================================================================
+springdoc:
+  api-docs:
+    enabled: ${SWAGGER_ENABLED:true}
+  swagger-ui:
+    enabled: ${SWAGGER_ENABLED:true}
+    # 按接口路径排序，多模块时更容易定位
+    operations-sorter: alpha
+    tags-sorter: alpha
 
 # ============================================================================
 #  日志

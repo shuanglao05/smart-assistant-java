@@ -188,6 +188,9 @@ CREATE TABLE IF NOT EXISTS `files` (
  `stored_path` VARCHAR(500) NOT NULL COMMENT '相对 backend 的存储路径',
  `size` BIGINT NULL DEFAULT 0 COMMENT '字节数',
  `content` MEDIUMTEXT NULL COMMENT '上传时抽取的正文（chat 直接注入上下文；上限 50 万字符）',
+ `index_status` VARCHAR(16) NOT NULL DEFAULT 'PENDING' COMMENT '索引状态：PENDING/INDEXING/READY/FAILED/SKIPPED',
+ `index_error` VARCHAR(500) NULL COMMENT '最近一次索引失败原因；成功为 NULL',
+ `chunk_count` INT NOT NULL DEFAULT 0 COMMENT '已生成的索引片段数',
  `created_at` DATETIME(6) NULL,
  PRIMARY KEY (`id`),
  KEY `idx_file_user` (`user_id`),
@@ -224,7 +227,8 @@ CREATE TABLE IF NOT EXISTS `kb_chunks` (
  `file_id` BIGINT NOT NULL,
  `chunk_index` INT NOT NULL DEFAULT 0 COMMENT '该文档内的片段序号',
  `chunk_text` MEDIUMTEXT NOT NULL COMMENT '片段正文（原名 text）',
- `embedding` MEDIUMTEXT NOT NULL COMMENT '向量，存 float 数组的 JSON 文本',
+ `embedding` MEDIUMTEXT NULL COMMENT '旧版向量：float 数组的 JSON 文本（已弃用，仅为读取历史数据保留）',
+ `embedding_bin` MEDIUMBLOB NULL COMMENT '向量：float32 小端字节序列（1024 维 = 4096 字节）',
  `created_at` DATETIME(6) NULL,
  PRIMARY KEY (`id`),
  KEY `idx_chunk_user` (`user_id`),
@@ -303,3 +307,148 @@ CREATE TABLE IF NOT EXISTS `app_settings` (
 -- （配置 spring.ai.chat.memory.repository.jdbc.initialize-schema=always），
 -- 手写容易与框架预期结构不一致，反而引发难查的问题。
 -- =============================================================================
+
+-- =============================================================================
+-- 增量迁移（幂等）：给【已存在】的 `files` 表补上「索引状态」三列
+--
+-- 【为什么需要这一段】
+-- 上面的 CREATE TABLE ... IF NOT EXISTS 只在"表还不存在"时生效。对已经建好的库，
+-- 表已存在 → 整条建表语句被跳过 → 新增的三列不会自动出现，实体一读就报"列不存在"。
+--
+-- 【为什么不用 `ADD COLUMN IF NOT EXISTS`】
+-- MySQL 并不支持这个语法（那是 MariaDB 的）。所以这里改用
+-- 「先查 information_schema 判断列在不在，再决定是否动态执行 ALTER」，
+-- 等价实现幂等：列已存在就执行一句无副作用的 SELECT 1，重复启动也不会报错。
+--
+-- 【为什么整段放在文件末尾】
+-- 下面的回填语句要读 `kb_chunks`，必须等它已经建好之后才能执行。
+-- =============================================================================
+
+SET @add_index_status := (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE `files` ADD COLUMN `index_status` VARCHAR(16) NOT NULL DEFAULT ''PENDING'' COMMENT ''索引状态：PENDING/INDEXING/READY/FAILED/SKIPPED'' AFTER `content`',
+    'SELECT 1')
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'files' AND COLUMN_NAME = 'index_status');
+PREPARE s1 FROM @add_index_status;
+EXECUTE s1;
+DEALLOCATE PREPARE s1;
+
+SET @add_index_error := (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE `files` ADD COLUMN `index_error` VARCHAR(500) NULL COMMENT ''最近一次索引失败原因；成功为 NULL'' AFTER `index_status`',
+    'SELECT 1')
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'files' AND COLUMN_NAME = 'index_error');
+PREPARE s2 FROM @add_index_error;
+EXECUTE s2;
+DEALLOCATE PREPARE s2;
+
+SET @add_chunk_count := (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE `files` ADD COLUMN `chunk_count` INT NOT NULL DEFAULT 0 COMMENT ''已生成的索引片段数'' AFTER `index_error`',
+    'SELECT 1')
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'files' AND COLUMN_NAME = 'chunk_count');
+PREPARE s3 FROM @add_chunk_count;
+EXECUTE s3;
+DEALLOCATE PREPARE s3;
+
+-- 回填：把"其实早就建好了索引"的老文件补成 READY，并写入真实的片段数，
+-- 否则它们会一直显示成 PENDING（等待索引），与事实不符。
+-- WHERE index_status='PENDING' 保证幂等：只补没标记过的，重复执行不会覆盖已有状态。
+UPDATE `files` f
+SET f.index_status = 'READY',
+    f.chunk_count = (SELECT COUNT(*) FROM `kb_chunks` c WHERE c.file_id = f.id)
+WHERE f.index_status = 'PENDING'
+  AND EXISTS (SELECT 1 FROM `kb_chunks` c WHERE c.file_id = f.id);
+
+-- =============================================================================
+-- 增量迁移（幂等）：`kb_chunks` 的向量改存二进制
+--
+-- 【改了什么】
+-- 新增 `embedding_bin MEDIUMBLOB` 存 float32 字节序列；并把旧的 `embedding`
+-- 由 NOT NULL 放宽为 NULL（新写入不再填它，只有历史数据还留着）。
+--
+-- 【为什么值得改】
+-- 1024 维向量：JSON 文本约 18KB，float32 二进制只要 4KB。检索要把该用户的全部片段
+-- 读进内存，用 JSON 存就得对每一行做一次文本解析 —— 那才是检索慢的主因。
+--
+-- 【历史数据怎么办】
+-- 读取侧做了"双读"（优先二进制、为空回退 JSON），所以老行不会因为这次改版而检索不到。
+-- 把它们真正搬成二进制有两条路：跑一次回填（启动参数 RAG_BACKFILL_EMBEDDINGS=true），
+-- 或对文档执行「重建索引」。两者都无需停机。
+-- =============================================================================
+
+SET @add_embedding_bin := (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE `kb_chunks` ADD COLUMN `embedding_bin` MEDIUMBLOB NULL COMMENT ''向量：float32 小端字节序列（1024 维 = 4096 字节）'' AFTER `embedding`',
+    'SELECT 1')
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kb_chunks' AND COLUMN_NAME = 'embedding_bin');
+PREPARE s4 FROM @add_embedding_bin;
+EXECUTE s4;
+DEALLOCATE PREPARE s4;
+
+-- 把旧列放宽为可空（只在"列存在且当前是 NOT NULL"时才执行，保证幂等）
+SET @relax_embedding := (
+  SELECT IF(COUNT(*) > 0,
+    'ALTER TABLE `kb_chunks` MODIFY COLUMN `embedding` MEDIUMTEXT NULL COMMENT ''旧版向量：float 数组的 JSON 文本（已弃用，仅为读取历史数据保留）''',
+    'SELECT 1')
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kb_chunks'
+    AND COLUMN_NAME = 'embedding' AND IS_NULLABLE = 'NO');
+PREPARE s5 FROM @relax_embedding;
+EXECUTE s5;
+DEALLOCATE PREPARE s5;
+
+-- =============================================================================
+-- 增量迁移（幂等）：给 `kb_chunks.chunk_text` 建全文索引（中文用 ngram 解析器）
+--
+-- 【用途】混合检索的关键词通道：向量检索擅长语义，但对"精确字面"（配置项名、编号、
+-- 专有名词）容易漏召回，全文索引正好补这一路。
+--
+-- 【为什么必须指定 ngram 解析器】MySQL 默认解析器按空格切词，中文整段会被当成一个词，
+-- 等于完全失效。ngram 按 2 字滑窗切分，中文才检索得到。
+-- 分词长度由只读系统变量 ngram_token_size 控制（默认 2，无需改动）。
+--
+-- 【幂等】CREATE INDEX 不支持 IF NOT EXISTS，故先查 information_schema.STATISTICS
+-- 判断索引是否已存在；已存在则执行一句无副作用的 SELECT 1。
+-- =============================================================================
+
+SET @add_ft_index := (
+  SELECT IF(COUNT(*) = 0,
+    'ALTER TABLE `kb_chunks` ADD FULLTEXT INDEX `ft_chunk_text` (`chunk_text`) WITH PARSER ngram',
+    'SELECT 1')
+  FROM information_schema.STATISTICS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'kb_chunks' AND INDEX_NAME = 'ft_chunk_text');
+PREPARE s6 FROM @add_ft_index;
+EXECUTE s6;
+DEALLOCATE PREPARE s6;
+
+-- -----------------------------------------------------------------------------
+-- 一轮回答的「执行阶段」记录（可观测性）
+--
+-- 用途：回答"这句为什么答得不准 / 为什么慢"—— 记录每一轮里的阶段耗时、
+-- 首字延迟、token 估算值与阶段补充信息（路由结果、命中片段数等）。
+--
+-- 设计要点：
+-- · 按"阶段一行"存，而不是一条记录塞一个大 JSON：新增阶段不用改表，
+--   还能直接按阶段做 GROUP BY 统计（例如首字延迟分布）；
+-- · exchange_id 存助手消息 id —— 前端拿到回答就知道它的 id，可直接查这一轮的过程；
+-- · detail 用 VARCHAR 而不是 JSON 列：内容短、要能直接在客户端里读；
+-- · 这是"附属数据"，不是业务数据，故有定期清理（见 ChatTraceService#cleanup）。
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `chat_traces` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `conversation_id` BIGINT NOT NULL,
+  `exchange_id` BIGINT NOT NULL COMMENT '本轮助手消息 id（前端查时间线的锚点）',
+  `stage` VARCHAR(32) NOT NULL COMMENT 'PREPARE/ROUTE/RETRIEVE/AGENT_BUILD/FIRST_TOKEN/DONE',
+  `duration_ms` INT NOT NULL DEFAULT 0 COMMENT '阶段耗时；FIRST_TOKEN 为从请求开始到首字，DONE 为总耗时',
+  `prompt_tokens` INT NULL COMMENT '提示词侧 token 估算值',
+  `completion_tokens` INT NULL COMMENT '回答侧 token 估算值',
+  `detail` VARCHAR(1000) NULL COMMENT '阶段补充信息（路由结果/命中片段数/模型名等）',
+  `created_at` DATETIME(6) NULL,
+  PRIMARY KEY (`id`),
+  KEY `idx_trace_conv` (`conversation_id`, `exchange_id`)
+) ENGINE = InnoDB DEFAULT CHARSET = utf8mb4 COLLATE = utf8mb4_0900_ai_ci COMMENT '回答执行阶段记录';

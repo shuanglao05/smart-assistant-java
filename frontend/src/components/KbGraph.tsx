@@ -9,8 +9,14 @@
  * collectionId —— 要展示的知识库 id；为 null 时不渲染（表示尚未选中知识库）
  *
  * 组件状态：
- * data / loading —— 图谱数据与加载中标记
+ * data / loading / error —— 图谱数据、加载中标记、加载失败原因
  * sel —— 当前选中节点（所属文档 / 片段序号 / 片段预览）
+ *
+ * ⚠️ 为什么要有 error 状态（不是多余）：
+ * 这里曾经是 `.catch(() => setData(null))` —— 失败与"这个库没有文档"两种完全不同的情况
+ * 落到同一个分支，于是**接口报错时界面会显示"这个库还没有文档，先点右上上传"**，
+ * 把人引向完全错误的方向（真实案例：前后端查询参数名不一致导致 422，排查了很久）。
+ * 现在失败会把原因显式显示出来：错了就要看得见。
  *
  * 依赖：
  * kbApi 的图谱接口；后端按 user_id + collection_id 过滤后返回，前端不做权限判断。
@@ -39,19 +45,28 @@ function truncate(s: string, n: number): string {
 export default function KbGraph({ collectionId }: { collectionId: number | null }) {
  const [data, setData] = useState<KbGraphData | null>(null)
  const [loading, setLoading] = useState(false)
+ /** 加载失败的原因；为 null 表示没出错。与"没有数据"是两回事，必须分开记。 */
+ const [error, setError] = useState<string | null>(null)
  const [sel, setSel] = useState<{ doc: string; index: number; preview: string } | null>(null)
 
  useEffect(() => {
  if (collectionId == null) {
  setData(null)
+ setError(null)
  return
  }
  setLoading(true)
  setSel(null)
+ setError(null)
  kbApi
  .graph(collectionId)
  .then(({ data }) => setData(data))
- .catch(() => setData(null))
+ .catch((e: any) => {
+ // 失败要看得见：把后端的 detail 原样显示（例如"缺少必填参数：collectionId"），
+ // 这比任何前端猜测都准确。
+ setData(null)
+ setError(e?.response?.data?.detail || e?.message || '未知错误')
+ })
  .finally(() => setLoading(false))
  }, [collectionId])
 
@@ -74,6 +89,18 @@ export default function KbGraph({ collectionId }: { collectionId: number | null 
  }
  if (loading) {
  return <div className="kbg-empty">加载中…</div>
+ }
+ // 失败分支必须放在"没有文档"之前 —— 否则报错会被误报成"这个库还没有文档"
+ if (error) {
+ return (
+ <div className="kbg-empty">
+ 关系图加载失败：{error}
+ <br />
+ <span style={{ fontSize: '0.92em', opacity: 0.8 }}>
+ 常见原因：接口参数名不一致（422）、后端未启动、登录已过期
+ </span>
+ </div>
+ )
  }
  if (!data || data.documents.length === 0) {
  return <div className="kbg-empty">这个库还没有文档，先点右上「上传到当前库」</div>

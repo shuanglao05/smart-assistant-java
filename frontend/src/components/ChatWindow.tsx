@@ -63,9 +63,11 @@ import {
  X,
 } from 'lucide-react'
 import { filesApi, sessionApi, type FileLimits } from '../api'
+import { takeSseEvents } from '../api/sse'
 import type { FileInfo, LlmOption, Message } from '../types'
 import MessageBubble from './MessageBubble'
 import NotificationBell from './NotificationBell'
+import TracePanel from './TracePanel'
 
 /** 导出格式：Markdown / 纯文本 / JSON / 网页（可在浏览器里「打印 → 另存为 PDF」）。 */
 type ExportFormat = 'md' | 'txt' | 'json' | 'html'
@@ -486,20 +488,13 @@ export default function ChatWindow({
  while (true) {
  const { done, value } = await reader.read()
  if (done) break
- buf += decoder.decode(value, { stream: true })
- let idx
- while ((idx = buf.indexOf('\n\n')) >= 0) {
- const evt = buf.slice(0, idx)
- buf = buf.slice(idx + 2)
- const line = evt.split('\n').find((l) => l.startsWith('data:'))
- if (!line) continue
- let data: any
- try {
- data = JSON.parse(line.slice(5).trim())
- } catch {
- continue
- }
- if (data.done) {
+        buf += decoder.decode(value, { stream: true })
+        // 取出缓冲区里【已经完整】的事件；只到了一半的帧留在 buf 里等下一块。
+        // 这段切分逻辑抽在 api/sse.ts，并有独立单测覆盖半帧 / 粘包 / 坏帧等边界。
+        const parsedEvents = takeSseEvents(buf)
+        buf = parsedEvents.rest
+        for (const data of parsedEvents.events) {
+          if (data.done) {
  // 结束事件：①置位恢复标志（不再触发 recoverMessages）；
  // ②标注本条回答所用模型（done 带回 provider/model）；
  // ③补齐这轮问答在后端的 id（done 带回 user_id/assistant_id，用于单条删除）；
@@ -840,11 +835,20 @@ export default function ChatWindow({
  )
  ) : (
  <>
+ {/* 执行过程（各阶段耗时 / 首字延迟 / 总耗时）：
+ 按钮紧贴头像（同一行），展开后把回答框往下推。
+ 只在消息已有后端 id 且不在流式中时才有 —— 没有 id 就没有锚点，
+ 流式中则这一轮还没跑完、时间线还不完整。 */}
  <MessageBubble
  role={m.role}
  content={m.content}
  streaming={streaming}
  onDelete={m.id != null && !loading ? () => deleteMessage(m.id) : undefined}
+ aboveBubble={
+ m.id != null && !streaming ? (
+ <TracePanel sessionId={sessionId} messageId={m.id} />
+ ) : undefined
+ }
  />
  {m.sources && m.sources.length > 0 && (
  <div className="msg-sources">

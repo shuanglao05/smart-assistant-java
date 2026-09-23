@@ -78,11 +78,19 @@ public final class KbDtos {
  /** 已建立的索引片段数（0 = 尚未索引）。 */
  int chunks,
  /** 所属知识库；null = 仅聊天附件，未归档。与 {@code FileItem.collectionId}(Long) 对齐。 */
- Long collectionId
+ Long collectionId,
+ /**
+ * 索引状态：PENDING / INDEXING / READY / FAILED / SKIPPED。
+ * <p>前端据此在文档列表里显示"索引中 / 已就绪 / 失败可重试"——
+ * 上传已改为后台异步索引，没有这个字段前端就无从得知进度。
+ */
+ String indexStatus,
+ /** 索引失败原因；未失败为 null。与 indexStatus=FAILED 配套展示。 */
+ String indexError
  ) {
  public static KbDocument from(FileItem f, int chunkCount) {
  return new KbDocument(f.getId(), f.getFilename(), f.getSize(), f.getCreatedAt(),
- chunkCount, f.getCollectionId());
+ chunkCount, f.getCollectionId(), f.getIndexStatus(), f.getIndexError());
  }
  }
 

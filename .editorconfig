@@ -1,0 +1,48 @@
+# =============================================================================
+# .editorconfig —— 统一缩进与换行规则
+#
+# 【为什么需要它】
+# 本项目此前所有 Java / TS / CSS 的缩进都被一次"折叠多余空格"的批量替换压平了，
+# 每层缩进都塌成 1 个空格。根因是"靠脚本改格式"——脚本猜不出续行、文本块这些结构。
+# 这里用 EditorConfig 把缩进规则声明成**可被 IDE 读取的配置**：
+# IDEA 默认就会读取 .editorconfig（设置 → 编辑器 → 代码样式 → 从 .editorconfig 读取），
+# 于是之后的格式化有唯一标准，不会再出现"这个文件 1 空格、那个文件 4 空格"。
+#
+# 【怎么恢复既有代码的缩进】
+# 在 IDEA 里对 backend/src 与 frontend/src 各执行一次「重新格式化代码」
+# （Ctrl+Alt+L），IDE 会按语言语法正确处理文本块与续行 —— 这是脚本做不到的。
+# =============================================================================
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+# Java：每层 4 空格（IDEA 默认风格）
+[*.java]
+indent_size = 4
+
+# 前端与配置：每层 2 空格
+[*.{ts,tsx,js,jsx,json,css,scss,html}]
+indent_size = 2
+
+# YAML：每层 2 空格（缩进在 YAML 里是语法，必须稳定）
+[*.{yml,yaml}]
+indent_size = 2
+
+# SQL 建表脚本：每层 2 空格
+[*.sql]
+indent_size = 2
+
+# Markdown 不要去掉行尾空格 —— 两个行尾空格在 Markdown 里表示"强制换行"
+[*.md]
+trim_trailing_whitespace = false
+
+# 批处理必须保持 CRLF，且不要动空白（cmd.exe 对换行敏感）
+[*.{bat,cmd}]
+end_of_line = crlf
+trim_trailing_whitespace = false

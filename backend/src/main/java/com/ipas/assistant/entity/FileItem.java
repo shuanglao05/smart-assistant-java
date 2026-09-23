@@ -69,6 +69,32 @@ public class FileItem {
  @Column(name = "content", columnDefinition = "MEDIUMTEXT")
  private String content;
 
+ /**
+ * 索引状态：{@code PENDING / INDEXING / READY / FAILED / SKIPPED}（常量见 {@code IndexStatus}）。
+ *
+ * <p>为什么需要它：索引是"切分 + 调嵌入服务 + 写片段"的耗时段，大文档要几十秒。
+ * 上传接口不再同步等它（否则必然超时），而是落库后立刻返回、后台异步索引，
+ * 于是"跑到哪一步了"必须有个字段承载，前端才能显示"索引中 / 已就绪 / 失败"。
+ *
+ * <p>默认 {@code PENDING}：新建记录天然处于"等待索引"。数据库侧该列也有
+ * {@code DEFAULT 'PENDING'}，保证绕过本实体的插入（如手工 SQL）不会写出 NULL。
+ */
+ @Column(name = "index_status", nullable = false, length = 16)
+ private String indexStatus = com.ipas.assistant.common.IndexStatus.PENDING;
+
+ /** 最近一次索引失败的原因；成功或未失败时为 null。列长 500，写入前会截断。 */
+ @Column(name = "index_error", length = 500)
+ private String indexError;
+
+ /**
+ * 已建立的索引片段数（与 {@code kb_chunks} 中该文件的条数一致；未索引 / 失败为 0）。
+ *
+ * <p>冗余存一份的原因：知识库文档列表要显示"已索引 N 段"，若每行都去 count 一次
+ * {@code kb_chunks}，列表页就会变成 N+1 查询。这里由索引流程在完成时一并写回，读时就零成本。
+ */
+ @Column(name = "chunk_count", nullable = false)
+ private Integer chunkCount = 0;
+
  @Column(name = "created_at")
  private LocalDateTime createdAt;
 

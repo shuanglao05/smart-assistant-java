@@ -5870,3 +5870,154 @@ html[data-fs='large'] {
  font-size: calc(1rem * 11 / 14);
  font-weight: 400;
 }
+
+/* ---------------- 助手消息：头像右侧整列（执行过程入口 + 气泡） ---------------- */
+/* 只在「有内容要放在气泡上方」时才包这一层（见 MessageBubble 的 aboveBubble），
+   所以用户消息的 DOM 与原来完全一致，不受影响。 */
+/* align-items 用 flex-start：气泡按内容宽度收缩，短回答不会撑成一整行 —— 与改动前观感一致 */
+.msg-body {
+ display: flex;
+ flex-direction: column;
+ align-items: flex-start;
+ flex: 1;
+ min-width: 0;
+}
+
+/* ---------------- 执行过程折叠面板（一轮回答的服务端时间线） ---------------- */
+/* 位置：头像右侧、回答上方（.msg-body 的第一个子元素）—— 按钮与头像同一行，
+   展开的内容把下方回答框整体往下推。 */
+.trace-wrap {
+ /* 6px 上边距 = (头像 28 - 按钮约 16) / 2，让按钮与头像视觉居中；
+   同时让回答框整体下移一点，不至于紧贴这一行 */
+ align-self: stretch;
+ margin: 6px 0 8px;
+}
+
+.trace-head {
+ display: inline-flex;
+ align-items: center;
+ gap: 5px;
+ font-family: inherit;
+ font-size: calc(1rem * 11.5 / 14);
+ color: var(--ink-soft);
+ background: transparent;
+ border: none;
+ padding: 0;
+ cursor: pointer;
+}
+
+.trace-head:hover {
+ color: var(--brand);
+}
+
+.trace-caret {
+ transition: transform 0.15s;
+}
+
+.trace-wrap.open .trace-caret {
+ transform: rotate(180deg);
+}
+
+.trace-body {
+ margin-top: 6px;
+ background: var(--panel-3);
+ border-radius: var(--r);
+ padding: 8px 10px;
+}
+
+.trace-hint {
+ font-size: calc(1rem * 12 / 14);
+ color: var(--ink-dim);
+}
+
+.trace-metrics {
+ display: flex;
+ flex-wrap: wrap;
+ gap: 14px;
+ margin-bottom: 8px;
+}
+
+.trace-metric {
+ display: inline-flex;
+ align-items: baseline;
+ gap: 4px;
+ font-size: calc(1rem * 12 / 14);
+ color: var(--ink);
+}
+
+.trace-metric b {
+ font-weight: 600;
+}
+
+.trace-metric em {
+ font-style: normal;
+ color: var(--ink-dim);
+ font-size: calc(1rem * 11 / 14);
+}
+
+.trace-rows {
+ display: flex;
+ flex-direction: column;
+ gap: 5px;
+}
+
+/* 三列：阶段名 / 条形 / 耗时；detail 需要时另起一整行 */
+.trace-row {
+ display: grid;
+ grid-template-columns: 96px 1fr auto;
+ align-items: center;
+ gap: 8px;
+ font-size: calc(1rem * 11.5 / 14);
+}
+
+.trace-name {
+ display: inline-flex;
+ align-items: center;
+ gap: 4px;
+ color: var(--ink-soft);
+ white-space: nowrap;
+}
+
+.trace-tag {
+ font-style: normal;
+ font-size: calc(1rem * 10 / 14);
+ color: var(--ink-dim);
+ border: 1px solid var(--line);
+ border-radius: 4px;
+ padding: 0 3px;
+}
+
+.trace-bar {
+ height: 6px;
+ background: var(--panel-2);
+ border-radius: 999px;
+ overflow: hidden;
+}
+
+.trace-bar i {
+ display: block;
+ height: 100%;
+ background: var(--brand);
+ border-radius: 999px;
+}
+
+.trace-ms {
+ color: var(--ink-dim);
+ text-align: right;
+ white-space: nowrap;
+}
+
+.trace-detail {
+ grid-column: 1 / -1;
+ color: var(--ink-dim);
+ font-size: calc(1rem * 11 / 14);
+ white-space: nowrap;
+ overflow: hidden;
+ text-overflow: ellipsis;
+}
+
+.trace-note {
+ margin-top: 7px;
+ color: var(--ink-dim);
+ font-size: calc(1rem * 10.5 / 14);
+}

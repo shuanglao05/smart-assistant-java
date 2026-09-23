@@ -49,6 +49,7 @@ import type {
  SkillCreate,
  SkillUpdate,
  Todo,
+ TraceTimeline,
  UserProfile,
  UserUpdatePayload,
 } from '../types'
@@ -78,6 +79,10 @@ export const sessionApi = {
  remove: (id: number) => client.delete(`/sessions/${id}`),
  removeMessage: (sessionId: number, messageId: number) =>
  client.delete(`/sessions/${sessionId}/messages/${messageId}`),
+ // 一轮回答的执行时间线（各阶段耗时 / 首字延迟 / token 估算）。
+ // 挂在会话与消息下，因为时间线的锚点就是"某个会话里的某条助手消息"。
+ trace: (sessionId: number, messageId: number) =>
+ client.get<TraceTimeline>(`/sessions/${sessionId}/messages/${messageId}/trace`),
  clearAll: () => client.delete(`/sessions`),
 }
 
